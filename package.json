@@ -1,0 +1,83 @@
+{
+  "name": "izi-queue",
+  "version": "0.1.0",
+  "description": "A minimal, reliable, database-backed job queue for Node.js inspired by Oban",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "jest",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "job-queue",
+    "background-jobs",
+    "task-queue",
+    "worker",
+    "postgresql",
+    "mysql",
+    "sqlite",
+    "oban",
+    "queue",
+    "jobs",
+    "async",
+    "typescript"
+  ],
+  "author": "Iago Cavalcante",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/IagoCavalcante/izi-queue.git"
+  },
+  "bugs": {
+    "url": "https://github.com/IagoCavalcante/izi-queue/issues"
+  },
+  "homepage": "https://github.com/IagoCavalcante/izi-queue#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "peerDependencies": {
+    "better-sqlite3": "^9.0.0",
+    "mysql2": "^3.0.0",
+    "pg": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    },
+    "better-sqlite3": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.10.0",
+    "@types/pg": "^8.10.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "better-sqlite3": "^12.5.0",
+    "eslint": "^8.55.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.3.0"
+  }
+}

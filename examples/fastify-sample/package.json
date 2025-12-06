@@ -1,0 +1,16 @@
+{
+  "name": "fastify-izi-queue-sample",
+  "version": "1.0.0",
+  "description": "Sample Fastify application using izi-queue with SQLite",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "fastify": "^4.25.0",
+    "better-sqlite3": "^11.0.0",
+    "izi-queue": "file:../.."
+  }
+}
