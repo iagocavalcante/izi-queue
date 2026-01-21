@@ -1,6 +1,7 @@
 import type {
   DatabaseAdapter,
   IziQueueConfig,
+  IsolationConfig,
   Job,
   JobInsertOptions,
   JobState,
@@ -13,7 +14,14 @@ import type { Plugin, PluginContext } from '../plugins/plugin.js';
 import { createJob } from './job.js';
 import { Queue } from './queue.js';
 import { telemetry } from './telemetry.js';
-import { registerWorker, clearWorkers, getWorker } from './worker.js';
+import {
+  registerWorker,
+  clearWorkers,
+  getWorker,
+  initializeIsolatedWorkers,
+  shutdownIsolatedWorkers,
+  getIsolationStats
+} from './worker.js';
 import { randomUUID } from 'crypto';
 
 export interface IziQueueFullConfig extends IziQueueConfig {
@@ -26,9 +34,10 @@ export interface InsertResult<T = Record<string, unknown>> {
 }
 
 export class IziQueue {
-  private config: Required<Omit<IziQueueFullConfig, 'queues' | 'plugins'>> & {
+  private config: Required<Omit<IziQueueFullConfig, 'queues' | 'plugins' | 'isolation'>> & {
     queues: QueueConfig[];
     plugins: Plugin[];
+    isolation?: IsolationConfig;
   };
   private queues: Map<string, Queue> = new Map();
   private stageTimer?: ReturnType<typeof setInterval>;
@@ -51,8 +60,13 @@ export class IziQueue {
       node: config.node ?? `node-${randomUUID().slice(0, 8)}`,
       stageInterval: config.stageInterval ?? 1000,
       shutdownGracePeriod: config.shutdownGracePeriod ?? 15000,
-      pollInterval: config.pollInterval ?? 1000
+      pollInterval: config.pollInterval ?? 1000,
+      isolation: config.isolation
     };
+
+    if (this.config.isolation) {
+      initializeIsolatedWorkers(this.config.isolation);
+    }
 
     for (const plugin of this.config.plugins) {
       if (plugin.validate) {
@@ -144,8 +158,18 @@ export class IziQueue {
 
   async shutdown(): Promise<void> {
     await this.stop();
+    await shutdownIsolatedWorkers();
     await this.config.database.close();
     clearWorkers();
+  }
+
+  getIsolationStats(): {
+    totalWorkers: number;
+    busyWorkers: number;
+    idleWorkers: number;
+    pendingJobs: number;
+  } | null {
+    return getIsolationStats();
   }
 
   async insert<T = Record<string, unknown>>(

@@ -18,6 +18,17 @@ export {
   executeWorker,
   getBackoffDelay,
   defineWorker,
-  WorkerResults
+  WorkerResults,
+  initializeIsolatedWorkers,
+  shutdownIsolatedWorkers,
+  terminateIsolatedJob,
+  getIsolationStats
 } from './worker.js';
 export { telemetry } from './telemetry.js';
+export {
+  ThreadPool,
+  type ThreadPoolConfig,
+  executeIsolated,
+  initializeIsolation,
+  shutdownIsolation
+} from './isolation/index.js';

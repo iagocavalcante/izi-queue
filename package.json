@@ -1,6 +1,6 @@
 {
   "name": "izi-queue",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A minimal, reliable, database-backed job queue for Node.js inspired by Oban",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -22,6 +22,7 @@
     "test": "jest",
     "test:coverage": "jest --coverage",
     "lint": "eslint src --ext .ts",
+    "benchmark": "npx tsx benchmarks/benchmark.ts",
     "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
@@ -78,6 +79,7 @@
     "eslint": "^8.55.0",
     "jest": "^29.7.0",
     "ts-jest": "^29.1.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.3.0"
   }
 }

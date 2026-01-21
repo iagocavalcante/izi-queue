@@ -1,5 +1,12 @@
-import type { Job, WorkerDefinition, WorkerResult } from '../types.js';
+import type { Job, WorkerDefinition, WorkerResult, IsolationConfig } from '../types.js';
 import { calculateBackoff } from './job.js';
+import {
+  executeIsolated,
+  initializeIsolation,
+  terminateIsolatedJob as terminateIsolated,
+  shutdownIsolation,
+  getIsolationStats
+} from './isolation/index.js';
 
 const workerRegistry = new Map<string, WorkerDefinition>();
 
@@ -36,6 +43,10 @@ export async function executeWorker(job: Job): Promise<WorkerResult> {
   }
 
   const timeout = worker.timeout ?? 60000;
+
+  if (worker.isolation?.isolated) {
+    return executeIsolated(job, worker.isolation, timeout);
+  }
 
   try {
     const result = await Promise.race([
@@ -86,3 +97,17 @@ export const WorkerResults = {
   cancel: (reason: string): WorkerResult => ({ status: 'cancel', reason }),
   snooze: (seconds: number): WorkerResult => ({ status: 'snooze', seconds })
 };
+
+export function initializeIsolatedWorkers(config?: IsolationConfig): void {
+  initializeIsolation(config);
+}
+
+export async function shutdownIsolatedWorkers(): Promise<void> {
+  await shutdownIsolation();
+}
+
+export async function terminateIsolatedJob(jobId: number): Promise<void> {
+  await terminateIsolated(jobId);
+}
+
+export { getIsolationStats };

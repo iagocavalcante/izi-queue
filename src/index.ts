@@ -20,7 +20,16 @@ export {
   getBackoffDelay,
   defineWorker,
   WorkerResults,
-  telemetry
+  telemetry,
+  initializeIsolatedWorkers,
+  shutdownIsolatedWorkers,
+  terminateIsolatedJob,
+  getIsolationStats,
+  ThreadPool,
+  type ThreadPoolConfig,
+  executeIsolated,
+  initializeIsolation,
+  shutdownIsolation
 } from './core/index.js';
 
 // Database adapters
@@ -62,5 +71,11 @@ export type {
   IziQueueConfig,
   TelemetryEvent,
   TelemetryPayload,
-  TelemetryHandler
+  TelemetryHandler,
+  IsolatedWorkerOptions,
+  IsolationConfig,
+  ResourceLimits,
+  SerializableJob,
+  WorkerThreadMessage,
+  WorkerThreadMessageType
 } from './types.js';

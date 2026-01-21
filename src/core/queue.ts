@@ -1,6 +1,6 @@
 import type { DatabaseAdapter, Job, QueueConfig } from '../types.js';
 import { formatError } from './job.js';
-import { executeWorker, getBackoffDelay, hasWorker } from './worker.js';
+import { executeWorker, getBackoffDelay, hasWorker, getWorker, terminateIsolatedJob } from './worker.js';
 import { telemetry } from './telemetry.js';
 
 type QueueState = 'running' | 'paused' | 'stopped';
@@ -10,6 +10,7 @@ export class Queue {
   private database: DatabaseAdapter;
   private state: QueueState = 'stopped';
   private running: Map<number, Promise<void>> = new Map();
+  private isolatedJobs: Set<number> = new Set();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private node: string;
 
@@ -58,15 +59,24 @@ export class Queue {
     }
 
     if (this.running.size > 0) {
-      const timeout = new Promise<void>((resolve) =>
-        setTimeout(resolve, gracePeriod)
+      const timeout = new Promise<'timeout' | 'done'>((resolve) =>
+        setTimeout(() => resolve('timeout'), gracePeriod)
       );
 
-      await Promise.race([
-        Promise.all(this.running.values()),
+      const result = await Promise.race([
+        Promise.all(this.running.values()).then(() => 'done' as const),
         timeout
       ]);
+
+      if (result === 'timeout' && this.isolatedJobs.size > 0) {
+        const terminatePromises = Array.from(this.isolatedJobs).map(jobId =>
+          terminateIsolatedJob(jobId).catch(() => {})
+        );
+        await Promise.all(terminatePromises);
+      }
     }
+
+    this.isolatedJobs.clear();
   }
 
   pause(): void {
@@ -140,6 +150,13 @@ export class Queue {
       return;
     }
 
+    const worker = getWorker(job.worker);
+    const isIsolated = worker?.isolation?.isolated === true;
+
+    if (isIsolated) {
+      this.isolatedJobs.add(job.id);
+    }
+
     try {
       const result = await executeWorker(job);
       const duration = Date.now() - startTime;
@@ -168,6 +185,8 @@ export class Queue {
         error instanceof Error ? error : new Error(String(error)),
         startTime
       );
+    } finally {
+      this.isolatedJobs.delete(job.id);
     }
   }
 

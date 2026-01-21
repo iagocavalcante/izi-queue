@@ -123,6 +123,7 @@ export class SQLiteAdapter extends BaseAdapter {
 
       const fetchStmt = this.db.prepare(`
         SELECT * FROM izi_jobs WHERE id IN (${placeholders})
+        ORDER BY priority ASC, scheduled_at ASC, id ASC
       `);
       return fetchStmt.all(...ids) as Record<string, unknown>[];
     });

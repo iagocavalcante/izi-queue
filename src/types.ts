@@ -58,6 +58,19 @@ export type WorkerResult =
   | { status: 'cancel'; reason: string }
   | { status: 'snooze'; seconds: number };
 
+export interface ResourceLimits {
+  maxOldGenerationSizeMb?: number;
+  maxYoungGenerationSizeMb?: number;
+  codeRangeSizeMb?: number;
+  stackSizeMb?: number;
+}
+
+export interface IsolatedWorkerOptions {
+  isolated: true;
+  workerPath: string;
+  resourceLimits?: ResourceLimits;
+}
+
 export interface WorkerDefinition<T = Record<string, unknown>> {
   name: string;
   perform: (job: Job<T>) => Promise<WorkerResult | void>;
@@ -66,6 +79,7 @@ export interface WorkerDefinition<T = Record<string, unknown>> {
   priority?: number;
   backoff?: (job: Job<T>) => number;
   timeout?: number;
+  isolation?: IsolatedWorkerOptions;
 }
 
 export interface QueueConfig {
@@ -73,6 +87,48 @@ export interface QueueConfig {
   limit: number;
   paused?: boolean;
   pollInterval?: number;
+}
+
+export interface SerializableJob<T = Record<string, unknown>> {
+  id: number;
+  state: JobState;
+  queue: string;
+  worker: string;
+  args: T;
+  meta: Record<string, unknown>;
+  tags: string[];
+  errors: Array<{
+    at: string;
+    attempt: number;
+    error: string;
+    stacktrace?: string;
+  }>;
+  attempt: number;
+  maxAttempts: number;
+  priority: number;
+  insertedAt: string;
+  scheduledAt: string;
+  attemptedAt: string | null;
+  completedAt: string | null;
+  discardedAt: string | null;
+  cancelledAt: string | null;
+}
+
+export type WorkerThreadMessageType =
+  | 'execute'
+  | 'result'
+  | 'error'
+  | 'terminate'
+  | 'ready';
+
+export interface WorkerThreadMessage {
+  type: WorkerThreadMessageType;
+  jobId?: number;
+  job?: SerializableJob;
+  workerPath?: string;
+  result?: WorkerResult;
+  error?: string;
+  stack?: string;
 }
 
 export interface DatabaseAdapter {
@@ -91,6 +147,12 @@ export interface DatabaseAdapter {
   notify?(queue: string): Promise<void>;
 }
 
+export interface IsolationConfig {
+  minThreads?: number;
+  maxThreads?: number;
+  idleTimeoutMs?: number;
+}
+
 export interface IziQueueConfig {
   database: DatabaseAdapter;
   queues: QueueConfig[] | Record<string, number>;
@@ -98,6 +160,7 @@ export interface IziQueueConfig {
   stageInterval?: number;
   shutdownGracePeriod?: number;
   pollInterval?: number;
+  isolation?: IsolationConfig;
 }
 
 export type TelemetryEvent =
@@ -108,10 +171,14 @@ export type TelemetryEvent =
   | 'job:snooze'
   | 'job:rescue'
   | 'job:unique_conflict'
+  | 'job:isolated:start'
+  | 'job:isolated:timeout'
   | 'queue:start'
   | 'queue:stop'
   | 'queue:pause'
   | 'queue:resume'
+  | 'thread:spawn'
+  | 'thread:exit'
   | 'plugin:start'
   | 'plugin:stop'
   | 'plugin:error';
@@ -124,6 +191,8 @@ export interface TelemetryPayload {
   error?: Error;
   result?: unknown;
   timestamp: Date;
+  threadId?: number;
+  isolated?: boolean;
 }
 
 export type TelemetryHandler = (payload: TelemetryPayload) => void;
