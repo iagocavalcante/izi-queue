@@ -1,6 +1,6 @@
 {
   "name": "izi-queue",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A minimal, reliable, database-backed job queue for Node.js inspired by Oban",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

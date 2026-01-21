@@ -40,7 +40,9 @@ export {
   PostgresAdapter,
   createPostgresAdapter,
   SQLiteAdapter,
-  createSQLiteAdapter
+  createSQLiteAdapter,
+  MySQLAdapter,
+  createMySQLAdapter
 } from './database/index.js';
 
 // Plugins

@@ -1,6 +1,7 @@
 export { BaseAdapter, SQL, rowToJob } from './adapter.js';
 export { PostgresAdapter, createPostgresAdapter } from './postgres.js';
 export { SQLiteAdapter, createSQLiteAdapter } from './sqlite.js';
+export { MySQLAdapter, createMySQLAdapter } from './mysql.js';
 export {
   postgresMigrations,
   sqliteMigrations,
