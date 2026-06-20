@@ -53,7 +53,7 @@
     "node": ">=18.0.0"
   },
   "peerDependencies": {
-    "better-sqlite3": "^9.0.0",
+    "better-sqlite3": "^9.0.0 || ^12.5.0",
     "mysql2": "^3.0.0",
     "pg": "^8.0.0"
   },
