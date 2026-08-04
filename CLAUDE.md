@@ -27,6 +27,7 @@ src/
 │   ├── izi-queue.ts      # Main IziQueue class (orchestrator)
 │   ├── queue.ts          # Queue class (worker execution)
 │   ├── job.ts            # Job state machine & backoff
+│   ├── unique.ts         # Uniqueness digest & advisory lock keys
 │   ├── worker.ts         # Worker registry & execution
 │   ├── telemetry.ts      # Event system
 │   └── isolation/        # Worker thread pool
@@ -82,7 +83,11 @@ Abstract interface with concrete implementations per database.
 export interface DatabaseAdapter {
   migrate(): Promise<void>;
   insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job>;
-  fetchJobs(queue: string, limit: number): Promise<Job[]>;
+  fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]>;
+  updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[]): Promise<Job | null>;
+  rescueStuckJobs(rescueAfter: number, nodeTtl?: number): Promise<number>;
+  insertUnique?(job, options): Promise<{ job: Job; conflict: boolean }>;
+  heartbeat?(node: string): Promise<void>;
   // ... more methods
 }
 
@@ -143,7 +148,17 @@ export const STATE_TRANSITIONS: Record<JobState, JobState[]> = {
 export function isValidTransition(from: JobState, to: JobState): boolean {
   return STATE_TRANSITIONS[from].includes(to);
 }
+
+// The set of states `to` is reachable from, passed to updateJob so the
+// database refuses an illegal transition.
+export function sourceStatesFor(to: JobState): JobState[];
 ```
+
+**Transitions are enforced in SQL, not in process.** `Queue` passes
+`sourceStatesFor(target)` to `updateJob`, which appends `AND state IN (...)`.
+Zero rows means the job moved on -- cancelled by an operator, or rescued onto
+another node -- and the write is refused rather than silently winning. The check
+cannot live in JavaScript because the race is between nodes.
 
 ### 5. Result Objects (Worker Results)
 
@@ -277,7 +292,7 @@ Each adapter handles dialect-specific syntax:
 
 ```sql
 CREATE TABLE izi_jobs (
-  id SERIAL PRIMARY KEY,
+  id BIGSERIAL PRIMARY KEY,
   state VARCHAR(20) NOT NULL DEFAULT 'available',
   queue VARCHAR(255) NOT NULL DEFAULT 'default',
   worker VARCHAR(255) NOT NULL,
@@ -288,29 +303,64 @@ CREATE TABLE izi_jobs (
   attempt INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 20,
   priority INTEGER NOT NULL DEFAULT 0,
-  inserted_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  scheduled_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  attempted_at TIMESTAMP,
-  completed_at TIMESTAMP,
-  discarded_at TIMESTAMP,
-  cancelled_at TIMESTAMP
+  inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  scheduled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  attempted_at TIMESTAMPTZ,
+  attempted_by VARCHAR(255),   -- node that claimed the job
+  unique_key VARCHAR(64),      -- uniqueness digest, null for non-unique jobs
+  completed_at TIMESTAMPTZ,
+  discarded_at TIMESTAMPTZ,
+  cancelled_at TIMESTAMPTZ
+);
+
+-- Node liveness, used to tell an orphaned job from a slow one
+CREATE TABLE izi_nodes (
+  name VARCHAR(255) PRIMARY KEY,
+  started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- Critical indexes
-CREATE INDEX idx_izi_jobs_queue_state ON izi_jobs (queue, state);
-CREATE INDEX idx_izi_jobs_scheduled_at ON izi_jobs (scheduled_at);
+CREATE INDEX izi_jobs_queue_state_idx ON izi_jobs (queue, state);
+CREATE INDEX izi_jobs_stageable_idx ON izi_jobs (scheduled_at)
+  WHERE state IN ('scheduled', 'retryable');
+CREATE INDEX izi_jobs_unique_key_idx ON izi_jobs (unique_key) WHERE unique_key IS NOT NULL;
 ```
+
+**Never index `args` directly.** A btree entry is capped at ~2704 bytes and a
+JSONB value that does not compress below it fails the insert outright. That is
+why uniqueness is keyed on a digest.
 
 ### Concurrency Control
 
 PostgreSQL uses `FOR UPDATE SKIP LOCKED` for non-blocking job fetching:
 
 ```sql
-SELECT * FROM izi_jobs
-WHERE queue = $1 AND state = 'available'
-ORDER BY priority ASC, scheduled_at ASC
-LIMIT $2
-FOR UPDATE SKIP LOCKED
+WITH claimed AS (
+  UPDATE izi_jobs
+  SET state = 'executing', attempted_at = NOW(), attempt = attempt + 1, attempted_by = $3
+  WHERE id IN (
+    SELECT id FROM izi_jobs
+    WHERE queue = $1 AND state = 'available'
+    ORDER BY priority ASC, scheduled_at ASC, id ASC
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+  )
+  RETURNING *
+)
+SELECT * FROM claimed ORDER BY priority ASC, scheduled_at ASC, id ASC
+```
+
+The outer `ORDER BY` is not redundant: `RETURNING` follows physical update order,
+not the subquery's ordering, so without it a high-priority job could be handed to
+the executor after a low-priority one from the same batch.
+
+**Staging** promotes both `scheduled` and `retryable` jobs once due. Omitting
+`retryable` means no job is ever retried:
+
+```sql
+UPDATE izi_jobs SET state = 'available'
+WHERE state IN ('scheduled', 'retryable') AND scheduled_at <= NOW()
 ```
 
 ## Testing Patterns
@@ -354,6 +404,8 @@ function createMockJob(overrides: Partial<Job> = {}): Job {
     insertedAt: new Date(),
     scheduledAt: new Date(),
     attemptedAt: null,
+    attemptedBy: null,
+    uniqueKey: null,
     completedAt: null,
     discardedAt: null,
     cancelledAt: null,
@@ -361,6 +413,41 @@ function createMockJob(overrides: Partial<Job> = {}): Job {
   };
 }
 ```
+
+### Waiting in tests
+
+Never sleep for a guessed duration. Wait on the condition, or on the telemetry
+event that marks it:
+
+```typescript
+import { waitFor, waitForEvent } from './helpers/wait.js';
+
+const done = await waitFor(async () => {
+  const job = await queue.getJob(id);
+  return job?.state === 'completed' ? job : null;
+}, { describe: 'the job to complete' });
+
+const refused = waitForEvent('job:transition_refused');
+```
+
+A fixed sleep bets the work finishes inside a window you guessed. That bet fails
+intermittently under load and makes every run pay the full duration regardless.
+
+### Running against real databases
+
+SQLite alone will not catch dialect bugs -- the priority-ordering and btree index
+defects were both invisible to it. The PostgreSQL and MySQL suites skip unless
+their connection strings are set:
+
+```bash
+docker run -d --rm -e POSTGRES_PASSWORD=izi -e POSTGRES_DB=izi -p 55432:5432 postgres:16-alpine
+docker run -d --rm -e MYSQL_ROOT_PASSWORD=izi -e MYSQL_DATABASE=izi -p 33306:3306 mysql:8
+
+IZI_TEST_POSTGRES_URL=postgres://postgres:izi@localhost:55432/izi \
+IZI_TEST_MYSQL_URL=mysql://root:izi@localhost:33306/izi npm test
+```
+
+CI runs both on every push, so a change that only works on SQLite fails there.
 
 ## Key Formulas
 
@@ -379,6 +466,18 @@ Lower priority value = higher priority (0 is highest).
 Jobs ordered by: `priority ASC, scheduled_at ASC`
 
 ## Common Tasks
+
+### Adding a Migration
+
+1. Append to the relevant array in `src/database/migrations.ts`, using the next
+   version for that dialect -- version numbers are tracked per database, so the
+   three arrays are free to diverge.
+2. `up` and `down` are **arrays of statements**, one statement per entry. They
+   are not split on `;`, which would tear apart a function body or a semicolon
+   inside a string literal.
+3. Migrations run under an advisory lock, so several nodes may boot at once.
+4. On PostgreSQL, DDL is transactional and a failure rolls back. On MySQL it is
+   not: a failure part-way leaves the schema changed and the version unrecorded.
 
 ### Adding a New Database Adapter
 
@@ -407,7 +506,13 @@ Jobs ordered by: `priority ASC, scheduled_at ASC`
 ## Performance Considerations
 
 - **Poll interval**: Default 1000ms, configurable per queue
+- **One poll loop per queue**: `dispatch()` moves the pending timer rather than
+  starting another. Starting a second loop per notification makes the query rate
+  grow with every insert until the database saturates.
 - **Batch fetching**: Fetch up to `limit` jobs per poll
 - **Skip locked**: PostgreSQL doesn't block on contested rows
 - **Worker threads**: Optional isolation for CPU-intensive work
 - **Connection pooling**: Use pg-pool for PostgreSQL
+- **Clear every timer you create**: the timeout race in `executeWorker` and the
+  grace-period race in `Queue.stop()` both leaked until fixed, each holding the
+  event loop open long after its work was done.
