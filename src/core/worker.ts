@@ -48,12 +48,13 @@ export async function executeWorker(job: Job): Promise<WorkerResult> {
     return executeIsolated(job, worker.isolation, timeout);
   }
 
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
   try {
     const result = await Promise.race([
       worker.perform(job),
-      new Promise<WorkerResult>((_, reject) =>
-        setTimeout(() => reject(new Error(`Job timed out after ${timeout}ms`)), timeout)
-      )
+      new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`Job timed out after ${timeout}ms`)), timeout);
+      })
     ]);
 
     if (result === undefined) {
@@ -66,6 +67,10 @@ export async function executeWorker(job: Job): Promise<WorkerResult> {
       status: 'error',
       error: error instanceof Error ? error : new Error(String(error))
     };
+  } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
   }
 }
 

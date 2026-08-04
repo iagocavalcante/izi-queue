@@ -221,6 +221,24 @@ describe('Worker Module', () => {
         expect((result.error as Error).message).toContain('timed out');
       }
     });
+
+    it('should clear the timeout after a worker completes', async () => {
+      jest.useFakeTimers();
+      try {
+        registerWorker({
+          name: 'FastWorker',
+          perform: async () => WorkerResults.ok(),
+          timeout: 60000
+        });
+
+        const result = await executeWorker(createMockJob({ worker: 'FastWorker' }));
+
+        expect(result.status).toBe('ok');
+        expect(jest.getTimerCount()).toBe(0);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
   });
 
   describe('WorkerResults', () => {
