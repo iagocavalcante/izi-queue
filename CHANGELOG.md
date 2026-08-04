@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below 1.0.0, breaking changes are released as minor versions.
 
-## [Unreleased]
+## [0.5.0] - 2026-08-04
 
 ### Fixed
 
@@ -15,33 +15,6 @@ While the version is below 1.0.0, breaking changes are released as minor version
   was never cleared. A process that drained in a second still kept the event
   loop alive for the full grace period, 15 seconds by default, before it could
   exit. Found while removing `forceExit` from the test runner.
-
-### Added
-
-- **Continuous integration.** Build, lint and typecheck, plus the full suite on
-  Node 18, 20, 22 and 24 against real PostgreSQL and MySQL service containers,
-  a matrix over the supported `better-sqlite3` majors, and a job that packs the
-  tarball and installs it into a clean project. Nothing enforced any of this
-  before, which is how retries stayed broken across two releases, how MySQL
-  shipped untested, and how the peer range drifted out of date. ([#42])
-- `pretest` builds before running the suite, so `npm test` works on a clean
-  checkout. The isolation tests load the compiled worker thread and previously
-  failed with 16 opaque errors until someone thought to build first. ([#42])
-
-### Changed
-
-- **Tests wait on conditions instead of sleeping.** Fixed-duration sleeps were
-  betting that work finished inside a guessed window, which fails intermittently
-  on a loaded machine and makes every run pay the full duration regardless. The
-  retry and lifecycle suites went from about nine seconds to 1.6, and no longer
-  depend on wall-clock timing. ([#41])
-- `forceExit` is gone from the Jest config, so a leaked handle now fails loudly
-  instead of being papered over. Two were found and fixed in the process: the
-  grace-period timer above, and a test that abandoned a running job without
-  releasing it. ([#41])
-
-### Fixed
-
 - **Snoozing consumed a retry attempt.** The attempt is claimed at fetch time,
   and snoozing did not compensate, so a job that snoozed while waiting on an
   external condition was eventually discarded having never failed once. Snooze
@@ -60,29 +33,6 @@ While the version is below 1.0.0, breaking changes are released as minor version
 - **The pruner reported deleted rows as completed jobs.** It emitted
   `job:complete` with no job attached, corrupting any metric counting
   completions. It now emits `jobs:pruned`. ([#39])
-
-### Added
-
-- `cancelJob(id)` and `retryJob(id)`, plus `retryJobs(criteria)`. Retrying a job
-  that had exhausted its attempts raises `max_attempts` so it can actually run
-  rather than being discarded again on its next fetch. ([#30])
-- Bulk operations accept `ids` and require at least one criterion. `cancelJobs({})`
-  previously cancelled every non-terminal job in the database, which a handler
-  forwarding optional filters would do when called with none of them. Acting on
-  everything now requires an explicit `{ all: true }`. ([#30])
-- `updateJob` accepts an optional list of expected source states.
-- Telemetry: `job:retry`, `job:unknown_worker`, `job:transition_refused`,
-  `jobs:pruned`.
-
-### Breaking
-
-- `cancelJobs({})` now throws instead of cancelling every job. Pass
-  `{ all: true }` for the old behaviour.
-- The pruner no longer emits `job:complete`. Anything counting prune runs
-  through that event should move to `jobs:pruned`.
-
-### Fixed
-
 - **Unique job keys could alter the SQL they were looked up with.** `unique.keys`
   entries were interpolated straight into the query in all three adapters. Keys
   are now hashed in JavaScript and never reach a query, so the injection vector
@@ -113,14 +63,49 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ### Added
 
+- **Continuous integration.** Build, lint and typecheck, plus the full suite on
+  Node 18, 20, 22 and 24 against real PostgreSQL and MySQL service containers,
+  a matrix over the supported `better-sqlite3` majors, and a job that packs the
+  tarball and installs it into a clean project. Nothing enforced any of this
+  before, which is how retries stayed broken across two releases, how MySQL
+  shipped untested, and how the peer range drifted out of date. ([#42])
+- `pretest` builds before running the suite, so `npm test` works on a clean
+  checkout. The isolation tests load the compiled worker thread and previously
+  failed with 16 opaque errors until someone thought to build first. ([#42])
+- `cancelJob(id)` and `retryJob(id)`, plus `retryJobs(criteria)`. Retrying a job
+  that had exhausted its attempts raises `max_attempts` so it can actually run
+  rather than being discarded again on its next fetch. ([#30])
+- Bulk operations accept `ids` and require at least one criterion. `cancelJobs({})`
+  previously cancelled every non-terminal job in the database, which a handler
+  forwarding optional filters would do when called with none of them. Acting on
+  everything now requires an explicit `{ all: true }`. ([#30])
+- `updateJob` accepts an optional list of expected source states.
+- Telemetry: `job:retry`, `job:unknown_worker`, `job:transition_refused`,
+  `jobs:pruned`.
 - `computeUniqueKey` and `advisoryLockKey` are exported for adapter authors.
 - `DatabaseAdapter.insertUnique`, an atomic insert-if-absent. Optional, so
   existing adapters keep working; those that do not implement it fall back to
   the previous non-atomic path.
 - `Job.uniqueKey` records the digest a unique job was inserted under.
 
+### Changed
+
+- **Tests wait on conditions instead of sleeping.** Fixed-duration sleeps were
+  betting that work finished inside a guessed window, which fails intermittently
+  on a loaded machine and makes every run pay the full duration regardless. The
+  retry and lifecycle suites went from about nine seconds to 1.6, and no longer
+  depend on wall-clock timing. ([#41])
+- `forceExit` is gone from the Jest config, so a leaked handle now fails loudly
+  instead of being papered over. Two were found and fixed in the process: the
+  grace-period timer above, and a test that abandoned a running job without
+  releasing it. ([#41])
+
 ### Breaking
 
+- `cancelJobs({})` now throws instead of cancelling every job. Pass
+  `{ all: true }` for the old behaviour.
+- The pruner no longer emits `job:complete`. Anything counting prune runs
+  through that event should move to `jobs:pruned`.
 - **Uniqueness now only considers jobs that were themselves inserted with
   `unique` options.** Previously a job enqueued without `unique` could block a
   later unique insert, because the comparison was made against raw args. A
@@ -259,3 +244,4 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#50]: https://github.com/iagocavalcante/izi-queue/issues/50
 [0.4.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.3.0...v0.4.0
 [0.4.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.0...v0.4.1
+[0.5.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.1...v0.5.0
