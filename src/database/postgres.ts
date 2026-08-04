@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import type { Job, JobState, UniqueOptions } from '../types.js';
-import { BaseAdapter, SQL, rowToJob } from './adapter.js';
+import { BaseAdapter, DEFAULT_NODE_TTL, SQL, rowToJob } from './adapter.js';
 import { postgresMigrations } from './migrations.js';
 
 export class PostgresAdapter extends BaseAdapter {
@@ -147,8 +147,8 @@ export class PostgresAdapter extends BaseAdapter {
     return rowToJob(result.rows[0]);
   }
 
-  async fetchJobs(queue: string, limit: number): Promise<Job[]> {
-    const result = await this.pool.query(SQL.postgres.fetchJobs, [queue, limit]);
+  async fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]> {
+    const result = await this.pool.query(SQL.postgres.fetchJobs, [queue, limit, node ?? null]);
     return result.rows.map(rowToJob);
   }
 
@@ -203,9 +203,21 @@ export class PostgresAdapter extends BaseAdapter {
     return result.rowCount ?? 0;
   }
 
-  async rescueStuckJobs(rescueAfter: number): Promise<number> {
-    const result = await this.pool.query(SQL.postgres.rescueStuckJobs, [rescueAfter]);
+  async rescueStuckJobs(rescueAfter: number, nodeTtl = DEFAULT_NODE_TTL): Promise<number> {
+    const result = await this.pool.query(SQL.postgres.rescueStuckJobs, [rescueAfter, nodeTtl]);
     return result.rowCount ?? 0;
+  }
+
+  async heartbeat(node: string): Promise<void> {
+    await this.pool.query(SQL.postgres.heartbeat, [node]);
+
+    // Node names are per-process, so a long-lived deployment would otherwise
+    // accumulate one dead row per restart.
+    await this.pool.query(SQL.postgres.pruneNodes, [DEFAULT_NODE_TTL * 20]);
+  }
+
+  async removeNode(node: string): Promise<void> {
+    await this.pool.query(SQL.postgres.removeNode, [node]);
   }
 
   async checkUnique(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null> {

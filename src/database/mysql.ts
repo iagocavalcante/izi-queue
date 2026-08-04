@@ -24,7 +24,7 @@ interface Pool {
   end(): Promise<void>;
 }
 import type { Job, JobState, UniqueOptions } from '../types.js';
-import { BaseAdapter, SQL, rowToJob } from './adapter.js';
+import { BaseAdapter, DEFAULT_NODE_TTL, SQL, rowToJob } from './adapter.js';
 import { mysqlMigrations } from './migrations.js';
 
 export class MySQLAdapter extends BaseAdapter {
@@ -138,7 +138,7 @@ export class MySQLAdapter extends BaseAdapter {
     return insertedJob;
   }
 
-  async fetchJobs(queue: string, limit: number): Promise<Job[]> {
+  async fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]> {
     const connection = await this.pool.getConnection();
     try {
       await connection.beginTransaction();
@@ -154,10 +154,7 @@ export class MySQLAdapter extends BaseAdapter {
       const ids = rows.map((r: RowDataPacket) => r.id as number);
 
       // Update the selected jobs
-      await connection.query(
-        `UPDATE izi_jobs SET state = 'executing', attempted_at = NOW(6), attempt = attempt + 1 WHERE id IN (?)`,
-        [ids]
-      );
+      await connection.query(SQL.mysql.updateFetched, [node ?? null, ids]);
 
       await connection.commit();
 
@@ -227,9 +224,24 @@ export class MySQLAdapter extends BaseAdapter {
     return result.affectedRows;
   }
 
-  async rescueStuckJobs(rescueAfter: number): Promise<number> {
-    const [result] = await this.pool.query<ResultSetHeader>(SQL.mysql.rescueStuckJobs, [rescueAfter]);
+  async rescueStuckJobs(rescueAfter: number, nodeTtl = DEFAULT_NODE_TTL): Promise<number> {
+    const [result] = await this.pool.query<ResultSetHeader>(SQL.mysql.rescueStuckJobs, [
+      rescueAfter,
+      nodeTtl
+    ]);
     return result.affectedRows;
+  }
+
+  async heartbeat(node: string): Promise<void> {
+    await this.pool.query(SQL.mysql.heartbeat, [node]);
+
+    // Node names are per-process, so a long-lived deployment would otherwise
+    // accumulate one dead row per restart.
+    await this.pool.query(SQL.mysql.pruneNodes, [DEFAULT_NODE_TTL * 20]);
+  }
+
+  async removeNode(node: string): Promise<void> {
+    await this.pool.query(SQL.mysql.removeNode, [node]);
   }
 
   async checkUnique(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null> {

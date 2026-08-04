@@ -30,6 +30,7 @@ describe('SQLiteAdapter', () => {
       priority: 0,
       scheduledAt: new Date(),
       attemptedAt: null,
+      attemptedBy: null,
       completedAt: null,
       discardedAt: null,
       cancelledAt: null,
@@ -622,6 +623,7 @@ describe('SQLiteAdapter', () => {
     it('should handle null values in nullable fields', async () => {
       const job = await adapter.insertJob(createJobData({
         attemptedAt: null,
+        attemptedBy: null,
         completedAt: null,
         discardedAt: null,
         cancelledAt: null

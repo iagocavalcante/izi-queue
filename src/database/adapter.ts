@@ -1,5 +1,12 @@
 import type { DatabaseAdapter, Job, JobState } from '../types.js';
 
+/**
+ * Seconds a node may go without a heartbeat before it is presumed dead and its
+ * in-flight jobs become eligible for rescue. Four missed beats at the default
+ * 15s heartbeat interval.
+ */
+export const DEFAULT_NODE_TTL = 60;
+
 export const SQL = {
   postgres: {
     createTable: `
@@ -35,7 +42,7 @@ export const SQL = {
     `,
     fetchJobs: `
       UPDATE izi_jobs
-      SET state = 'executing', attempted_at = NOW(), attempt = attempt + 1
+      SET state = 'executing', attempted_at = NOW(), attempt = attempt + 1, attempted_by = $3
       WHERE id IN (
         SELECT id FROM izi_jobs
         WHERE queue = $1 AND state = 'available'
@@ -75,11 +82,26 @@ export const SQL = {
     `,
     rescueStuckJobs: `
       UPDATE izi_jobs
-      SET state = 'available', scheduled_at = NOW()
+      SET state = CASE WHEN attempt >= max_attempts THEN 'discarded' ELSE 'available' END,
+          scheduled_at = NOW(),
+          discarded_at = CASE WHEN attempt >= max_attempts THEN NOW() ELSE discarded_at END
       WHERE state = 'executing'
         AND attempted_at < NOW() - INTERVAL '1 second' * $1
+        AND (
+          attempted_by IS NULL
+          OR attempted_by NOT IN (
+            SELECT name FROM izi_nodes
+            WHERE heartbeat_at > NOW() - INTERVAL '1 second' * $2
+          )
+        )
       RETURNING *
     `,
+    heartbeat: `
+      INSERT INTO izi_nodes (name, heartbeat_at) VALUES ($1, NOW())
+      ON CONFLICT (name) DO UPDATE SET heartbeat_at = NOW()
+    `,
+    removeNode: 'DELETE FROM izi_nodes WHERE name = $1',
+    pruneNodes: `DELETE FROM izi_nodes WHERE heartbeat_at < NOW() - INTERVAL '1 second' * $1`,
     checkUnique: `
       SELECT * FROM izi_jobs
       WHERE worker = $1
@@ -126,7 +148,7 @@ export const SQL = {
     `,
     updateFetched: `
       UPDATE izi_jobs
-      SET state = 'executing', attempted_at = NOW(6), attempt = attempt + 1
+      SET state = 'executing', attempted_at = NOW(6), attempt = attempt + 1, attempted_by = ?
       WHERE id IN (?)
     `,
     updateJob: `
@@ -158,10 +180,25 @@ export const SQL = {
     `,
     rescueStuckJobs: `
       UPDATE izi_jobs
-      SET state = 'available', scheduled_at = NOW()
+      SET state = CASE WHEN attempt >= max_attempts THEN 'discarded' ELSE 'available' END,
+          scheduled_at = NOW(6),
+          discarded_at = CASE WHEN attempt >= max_attempts THEN NOW(6) ELSE discarded_at END
       WHERE state = 'executing'
         AND attempted_at < DATE_SUB(NOW(), INTERVAL ? SECOND)
+        AND (
+          attempted_by IS NULL
+          OR attempted_by NOT IN (
+            SELECT name FROM izi_nodes
+            WHERE heartbeat_at > DATE_SUB(NOW(), INTERVAL ? SECOND)
+          )
+        )
     `,
+    heartbeat: `
+      INSERT INTO izi_nodes (name, heartbeat_at) VALUES (?, NOW(6))
+      ON DUPLICATE KEY UPDATE heartbeat_at = NOW(6)
+    `,
+    removeNode: 'DELETE FROM izi_nodes WHERE name = ?',
+    pruneNodes: 'DELETE FROM izi_nodes WHERE heartbeat_at < DATE_SUB(NOW(), INTERVAL ? SECOND)',
     checkUnique: `
       SELECT * FROM izi_jobs
       WHERE worker = ?
@@ -203,7 +240,7 @@ export const SQL = {
     `,
     fetchJobs: `
       UPDATE izi_jobs
-      SET state = 'executing', attempted_at = datetime('now'), attempt = attempt + 1
+      SET state = 'executing', attempted_at = datetime('now'), attempt = attempt + 1, attempted_by = ?
       WHERE id IN (
         SELECT id FROM izi_jobs
         WHERE queue = ? AND state = 'available'
@@ -242,11 +279,26 @@ export const SQL = {
     `,
     rescueStuckJobs: `
       UPDATE izi_jobs
-      SET state = 'available', scheduled_at = datetime('now')
+      SET state = CASE WHEN attempt >= max_attempts THEN 'discarded' ELSE 'available' END,
+          scheduled_at = datetime('now'),
+          discarded_at = CASE WHEN attempt >= max_attempts THEN datetime('now') ELSE discarded_at END
       WHERE state = 'executing'
         AND datetime(attempted_at) < datetime('now', '-' || ? || ' seconds')
+        AND (
+          attempted_by IS NULL
+          OR attempted_by NOT IN (
+            SELECT name FROM izi_nodes
+            WHERE datetime(heartbeat_at) > datetime('now', '-' || ? || ' seconds')
+          )
+        )
       RETURNING *
     `,
+    heartbeat: `
+      INSERT INTO izi_nodes (name, heartbeat_at) VALUES (?, datetime('now'))
+      ON CONFLICT(name) DO UPDATE SET heartbeat_at = datetime('now')
+    `,
+    removeNode: 'DELETE FROM izi_nodes WHERE name = ?',
+    pruneNodes: `DELETE FROM izi_nodes WHERE datetime(heartbeat_at) < datetime('now', '-' || ? || ' seconds')`,
     checkUnique: `
       SELECT * FROM izi_jobs
       WHERE worker = ?
@@ -289,6 +341,7 @@ export function rowToJob(row: Record<string, unknown>): Job {
     insertedAt: parseDate(row.inserted_at) as Date,
     scheduledAt: parseDate(row.scheduled_at) as Date,
     attemptedAt: parseDate(row.attempted_at),
+    attemptedBy: (row.attempted_by as string | null) ?? null,
     completedAt: parseDate(row.completed_at),
     discardedAt: parseDate(row.discarded_at),
     cancelledAt: parseDate(row.cancelled_at)
@@ -298,12 +351,12 @@ export function rowToJob(row: Record<string, unknown>): Job {
 export abstract class BaseAdapter implements DatabaseAdapter {
   abstract migrate(): Promise<void>;
   abstract insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job>;
-  abstract fetchJobs(queue: string, limit: number): Promise<Job[]>;
+  abstract fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]>;
   abstract updateJob(id: number, updates: Partial<Job>): Promise<Job | null>;
   abstract getJob(id: number): Promise<Job | null>;
   abstract pruneJobs(maxAge: number): Promise<number>;
   abstract stageJobs(): Promise<number>;
   abstract cancelJobs(criteria: { queue?: string; worker?: string; state?: JobState[] }): Promise<number>;
-  abstract rescueStuckJobs(rescueAfter: number): Promise<number>;
+  abstract rescueStuckJobs(rescueAfter: number, nodeTtl?: number): Promise<number>;
   abstract close(): Promise<void>;
 }

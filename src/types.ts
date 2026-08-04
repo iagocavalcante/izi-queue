@@ -29,6 +29,8 @@ export interface Job<T = Record<string, unknown>> {
   insertedAt: Date;
   scheduledAt: Date;
   attemptedAt: Date | null;
+  /** Name of the node that last fetched this job. Null for jobs never attempted. */
+  attemptedBy: string | null;
   completedAt: Date | null;
   discardedAt: Date | null;
   cancelledAt: Date | null;
@@ -109,6 +111,7 @@ export interface SerializableJob<T = Record<string, unknown>> {
   insertedAt: string;
   scheduledAt: string;
   attemptedAt: string | null;
+  attemptedBy: string | null;
   completedAt: string | null;
   discardedAt: string | null;
   cancelledAt: string | null;
@@ -134,13 +137,27 @@ export interface WorkerThreadMessage {
 export interface DatabaseAdapter {
   migrate(): Promise<void>;
   insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job>;
-  fetchJobs(queue: string, limit: number): Promise<Job[]>;
+  /**
+   * Claims up to `limit` available jobs for `queue`, marking them executing.
+   * `node` is recorded on each claimed job so orphan rescue can tell a job
+   * abandoned by a dead node from one still running on a live node.
+   */
+  fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]>;
   updateJob(id: number, updates: Partial<Job>): Promise<Job | null>;
   getJob(id: number): Promise<Job | null>;
   pruneJobs(maxAge: number): Promise<number>;
   stageJobs(): Promise<number>;
   cancelJobs(criteria: { queue?: string; worker?: string; state?: JobState[] }): Promise<number>;
-  rescueStuckJobs(rescueAfter: number): Promise<number>;
+  /**
+   * Returns jobs abandoned by dead nodes to the queue (or discards them when
+   * their attempts are exhausted). `nodeTtl` is how many seconds a node may go
+   * without a heartbeat before it is presumed dead.
+   */
+  rescueStuckJobs(rescueAfter: number, nodeTtl?: number): Promise<number>;
+  /** Registers/refreshes this node's liveness record. */
+  heartbeat?(node: string): Promise<void>;
+  /** Removes a node's liveness record on graceful shutdown. */
+  removeNode?(node: string): Promise<void>;
   checkUnique?(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null>;
   close(): Promise<void>;
   listen?(callback: (event: { queue: string }) => void): Promise<void>;
@@ -159,6 +176,12 @@ export interface IziQueueConfig {
   node?: string;
   stageInterval?: number;
   shutdownGracePeriod?: number;
+  /**
+   * How often this node refreshes its liveness record, in ms. A node is presumed
+   * dead after four missed heartbeats (minimum 60s), which is when its in-flight
+   * jobs become eligible for rescue.
+   */
+  heartbeatInterval?: number;
   pollInterval?: number;
   isolation?: IsolationConfig;
 }
