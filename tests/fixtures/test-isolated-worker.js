@@ -1,5 +1,5 @@
 // Test worker for isolated execution tests
-import { isMainThread } from 'worker_threads';
+import { isMainThread, threadId } from 'worker_threads';
 
 export async function perform(job) {
   // Verify we're running in a worker thread
@@ -19,12 +19,16 @@ export async function perform(job) {
         value: { processed: true, jobId: job.id, isMainThread }
       };
 
-    case 'delay':
+    case 'delay': {
+      // Reported so tests can observe parallelism directly, rather than
+      // inferring it from how long the batch took on the wall clock.
+      const startedAt = Date.now();
       await new Promise(resolve => setTimeout(resolve, delay || 100));
       return {
         status: 'ok',
-        value: { delayed: delay, jobId: job.id }
+        value: { delayed: delay, jobId: job.id, threadId, startedAt, finishedAt: Date.now() }
       };
+    }
 
     case 'crash':
       throw new Error(crashMessage || 'Intentional crash');

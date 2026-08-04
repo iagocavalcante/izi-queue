@@ -8,6 +8,17 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ## [0.6.0] - 2026-08-04
 
+### Fixed
+
+- **Worker isolation never worked outside the test runner.** The published
+  package is ESM-only, and the worker path resolver called `require('fs')`
+  unconditionally, so every isolated job failed with `require is not defined`.
+  The unit tests stayed green because Jest transpiles to CommonJS, where
+  `require` exists -- they never exercised the shipped artifact. Resolution now
+  uses `import.meta.url`, and CI runs a real isolated job through the packed
+  tarball in an ESM project, which is the only place this class of breakage is
+  visible.
+
 ### Added
 
 - **Transactional inserts.** Pass your open transaction as `tx` and the job is
