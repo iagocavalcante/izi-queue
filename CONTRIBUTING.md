@@ -53,8 +53,15 @@ npm test
 # Build the project
 npm run build
 
-# Run tests
+# Run tests (SQLite only; PostgreSQL and MySQL suites skip)
 npm test
+
+# Run everything, including the PostgreSQL and MySQL adapter suites
+docker run -d --rm -e POSTGRES_PASSWORD=izi -e POSTGRES_DB=izi -p 55432:5432 postgres:16-alpine
+docker run -d --rm -e MYSQL_ROOT_PASSWORD=izi -e MYSQL_DATABASE=izi -p 33306:3306 mysql:8
+
+IZI_TEST_POSTGRES_URL=postgres://postgres:izi@localhost:55432/izi \
+IZI_TEST_MYSQL_URL=mysql://root:izi@localhost:33306/izi npm test
 
 # Run tests with coverage
 npm run test:coverage

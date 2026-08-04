@@ -1,5 +1,6 @@
 # izi-queue
 
+[![CI](https://github.com/iagocavalcante/izi-queue/actions/workflows/ci.yml/badge.svg)](https://github.com/iagocavalcante/izi-queue/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/izi-queue.svg)](https://www.npmjs.com/package/izi-queue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js Version](https://img.shields.io/node/v/izi-queue.svg)](https://nodejs.org)
@@ -10,10 +11,14 @@ A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](ht
 ## Why izi-queue?
 
 - **No extra infrastructure** - Use your existing PostgreSQL, SQLite, or MySQL database
-- **ACID guarantees** - Jobs are inserted transactionally with your business data
+- **Durable** - Jobs live in your database, survive restarts, and are recovered when a node dies
 - **Simple API** - Define workers, insert jobs, done
 - **TypeScript-first** - Full type safety and excellent DX
 - **Battle-tested patterns** - Inspired by Oban's proven design
+
+> **Not yet supported:** inserting a job inside your own transaction. Every insert
+> currently commits on its own connection, so a job can outlive a rolled-back
+> business write. Tracked in [#21](https://github.com/iagocavalcante/izi-queue/issues/21).
 
 ## Table of Contents
 
@@ -27,6 +32,9 @@ A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](ht
   - [Worker Isolation](#worker-isolation)
   - [Plugins](#plugins)
   - [Telemetry](#telemetry)
+- [Managing Jobs](#managing-jobs)
+- [Migrations](#migrations)
+- [Running Multiple Nodes](#running-multiple-nodes)
 - [Worker Results](#worker-results)
 - [Database Support](#database-support)
 - [Examples](#examples)
@@ -72,14 +80,28 @@ const queue = new IziQueue({
   queues: { default: 10 }, // queue name: concurrency limit
 });
 
-// 3. Register worker and start
-queue.registerWorker(sendEmailWorker);
+// 3. Register worker, run migrations, and start
+queue.register(sendEmailWorker);
+await queue.migrate();
 await queue.start();
 
-// 4. Insert jobs
+// 4. Insert jobs. Job arguments go under `args`.
 await queue.insert('send_email', {
-  to: 'user@example.com',
-  subject: 'Welcome!',
+  args: { to: 'user@example.com', subject: 'Welcome!' },
+});
+```
+
+`insert` takes the worker name (or definition) and a single options object.
+Everything other than `args` is optional:
+
+```typescript
+await queue.insert('send_email', {
+  args: { to: 'user@example.com' },
+  queue: 'emails',
+  priority: 0,
+  maxAttempts: 5,
+  scheduledAt: new Date(Date.now() + 3600000),
+  tags: ['welcome'],
 });
 ```
 
@@ -89,10 +111,11 @@ await queue.insert('send_email', {
 
 ```typescript
 // Run immediately
-await queue.insert('send_email', args);
+await queue.insert('send_email', { args });
 
 // Schedule for later
-await queue.insert('send_email', args, {
+await queue.insert('send_email', {
+  args,
   scheduledAt: new Date(Date.now() + 3600000), // 1 hour from now
 });
 ```
@@ -119,8 +142,8 @@ const customBackoffWorker = defineWorker('custom_worker', async (job) => {
 ### Priority Queues
 
 ```typescript
-await queue.insert('urgent_task', args, { priority: 0 }); // High priority (lower = higher)
-await queue.insert('background_task', args, { priority: 10 }); // Low priority
+await queue.insert('urgent_task', { args, priority: 0 });      // High priority (lower = higher)
+await queue.insert('background_task', { args, priority: 10 }); // Low priority
 ```
 
 ### Unique Jobs
@@ -128,14 +151,35 @@ await queue.insert('background_task', args, { priority: 10 }); // Low priority
 Prevent duplicate jobs from being enqueued:
 
 ```typescript
-await queue.insert('send_digest', args, {
+await queue.insert('send_digest', {
+  args,
   unique: {
     fields: ['worker', 'args'], // Uniqueness based on these fields
-    period: 3600, // Only one per hour (in seconds)
-    states: ['scheduled', 'available', 'executing'], // Check these states
+    keys: ['userId'],           // Or compare only these keys within args
+    period: 3600,               // Only one per hour (in seconds), or 'infinity'
+    states: ['scheduled', 'available', 'executing'],
   },
 });
 ```
+
+Use `insertWithResult` when you need to know whether a duplicate was found:
+
+```typescript
+const { job, conflict } = await queue.insertWithResult('send_digest', {
+  args,
+  unique: { period: 3600 },
+});
+```
+
+Insertion is atomic, so concurrent callers across multiple nodes produce exactly
+one job. Two notes on the semantics:
+
+- **Only jobs inserted with `unique` participate.** A job enqueued without
+  `unique` options carries no uniqueness key and will not block a later unique
+  insert. This matches Oban, where uniqueness is a property of how a job was
+  enqueued.
+- **Argument order does not matter.** `{ a: 1, b: 2 }` and `{ b: 2, a: 1 }` are
+  the same job on every adapter.
 
 ### Worker Isolation
 
@@ -149,14 +193,29 @@ const isolatedWorker = defineWorker('heavy_computation', async (job) => {
   isolation: {
     isolated: true,
     workerPath: './workers/heavy-computation.js',
-    resourceLimits: {
-      maxOldGenerationSizeMb: 128,
-      maxYoungGenerationSizeMb: 32,
-    },
   },
   timeout: 30000, // 30 seconds
 });
 ```
+
+Configure the thread pool on the queue:
+
+```typescript
+const queue = new IziQueue({
+  database: createSQLiteAdapter(db),
+  queues: { default: 4 },
+  isolation: { minThreads: 0, maxThreads: 4, idleTimeoutMs: 30000 },
+});
+```
+
+> **Keep a queue's concurrency at or below `maxThreads`.** A job that finds the
+> pool saturated currently fails with `No available worker threads` and consumes
+> a retry attempt rather than waiting. Tracked in
+> [#22](https://github.com/iagocavalcante/izi-queue/issues/22).
+>
+> `resourceLimits` is accepted by the type but **not currently applied** to
+> worker threads, so isolated workers run without a memory cap. Tracked in
+> [#23](https://github.com/iagocavalcante/izi-queue/issues/23).
 
 ### Plugins
 
@@ -169,11 +228,23 @@ const queue = new IziQueue({
   database: createSQLiteAdapter(db),
   queues: { default: 10 },
   plugins: [
-    new LifelinePlugin({ rescueAfter: 300 }), // Rescue stuck jobs after 5 min
-    new PrunerPlugin({ maxAge: 86400 }), // Prune completed jobs older than 24h
+    new LifelinePlugin({ rescueAfter: 300 }), // Rescue orphaned jobs after 5 min
+    new PrunerPlugin({ maxAge: 86400 }),      // Prune finished jobs older than 24h
   ],
 });
 ```
+
+**Lifeline** returns jobs abandoned by a node that stopped heartbeating. It will
+not touch a job that is still running on a live node, so `rescueAfter` does not
+have to exceed your worker timeouts.
+
+**Pruner** deletes finished jobs. It currently deletes in one unbounded
+statement, so the first run against a large backlog is a long-running delete
+([#29](https://github.com/iagocavalcante/izi-queue/issues/29)).
+
+> Every node runs every plugin: there is no leader election yet
+> ([#26](https://github.com/iagocavalcante/izi-queue/issues/26)). With several
+> nodes this duplicates maintenance work against the same rows.
 
 ### Telemetry
 
@@ -195,11 +266,83 @@ queue.on('*', ({ event, job }) => {
 ```
 
 **Available events:**
-- `job:start`, `job:complete`, `job:error`, `job:cancel`, `job:snooze`, `job:rescue`
+- `job:start`, `job:complete`, `job:error`, `job:cancel`, `job:snooze`
+- `job:retry`, `job:rescue`, `job:unknown_worker`, `job:transition_refused`
 - `job:unique_conflict`, `job:isolated:start`, `job:isolated:timeout`
+- `jobs:pruned`
 - `queue:start`, `queue:stop`, `queue:pause`, `queue:resume`
 - `thread:spawn`, `thread:exit`
 - `plugin:start`, `plugin:stop`, `plugin:error`
+
+`job:transition_refused` fires when a result could not be written because the
+job had already moved on — cancelled by an operator, or rescued onto another
+node. `jobs:pruned` and `job:rescue` carry `result`, not `job`.
+
+## Managing Jobs
+
+```typescript
+const job = await queue.getJob(id);
+
+// Cancel one job, or a scoped set
+await queue.cancelJob(id);
+await queue.cancelJobs({ queue: 'emails' });
+await queue.cancelJobs({ worker: 'SendEmail', state: ['available', 'scheduled'] });
+
+// Return discarded or cancelled jobs to the queue
+await queue.retryJob(id);
+await queue.retryJobs({ worker: 'SendEmail' });
+```
+
+Bulk operations require at least one criterion. `cancelJobs({})` throws rather
+than cancelling everything, so a handler that forwards optional filters cannot
+wipe the queue when called with none of them. To act on every job, be explicit:
+
+```typescript
+await queue.cancelJobs({ all: true });
+```
+
+Cancelling a job that is currently executing marks it cancelled and causes its
+result to be discarded when the worker finishes. It does **not** interrupt the
+worker mid-run ([#30](https://github.com/iagocavalcante/izi-queue/issues/30)).
+
+## Migrations
+
+`migrate()` creates and upgrades the schema, and is safe to call from every node
+at boot — it holds an advisory lock, so concurrent starts do not collide.
+
+```typescript
+await queue.migrate();
+```
+
+It applies DDL against `izi_jobs`, so on a large table review what a release
+adds before deploying. Each version's migrations are listed in
+[CHANGELOG.md](CHANGELOG.md).
+
+## Running Multiple Nodes
+
+Jobs are claimed with `FOR UPDATE SKIP LOCKED` on PostgreSQL and MySQL, so any
+number of nodes can share a queue without handing out the same job twice.
+
+Each node records a heartbeat. When one stops heartbeating, the Lifeline plugin
+returns its in-flight jobs to the queue — and only its jobs, so a slow job on a
+healthy node is never restarted underneath you.
+
+```typescript
+const queue = new IziQueue({
+  database: adapter,
+  queues: { default: 10 },
+  node: 'worker-1',        // defaults to a random id
+  heartbeatInterval: 15000,
+});
+```
+
+Two caveats when scaling out:
+
+- Concurrency limits are **per node**. Five nodes with `{ default: 10 }` run up
+  to 50 jobs at once ([#37](https://github.com/iagocavalcante/izi-queue/issues/37)).
+- Every node runs every plugin ([#26](https://github.com/iagocavalcante/izi-queue/issues/26)).
+- A worker that blocks the event loop for longer than the node TTL stops the
+  heartbeat and may be treated as dead. Use isolated workers for CPU-bound work.
 
 ## Worker Results
 
@@ -209,13 +352,13 @@ async perform(job) {
   return WorkerResults.ok();
   return WorkerResults.ok({ processed: 100 }); // With metadata
 
-  // Retry later - job will be retried with backoff
+  // Retry later - job moves to `retryable` and is retried with backoff
   return WorkerResults.error('Temporary failure');
 
-  // Discard - don't retry, job is invalid
+  // Cancel - job moves to `cancelled` and is not retried
   return WorkerResults.cancel('Invalid data');
 
-  // Snooze - reschedule for later
+  // Snooze - reschedule without consuming a retry attempt
   return WorkerResults.snooze(60); // Try again in 60 seconds
 }
 ```
