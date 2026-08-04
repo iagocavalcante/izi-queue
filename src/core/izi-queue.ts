@@ -5,6 +5,7 @@ import type {
   Job,
   JobCriteria,
   JobInsertOptions,
+  TransactionHandle,
   QueueConfig,
   TelemetryEvent,
   TelemetryHandler,
@@ -269,28 +270,40 @@ export class IziQueue {
       } as Omit<Job, 'id' | 'insertedAt'>;
 
       const result = this.config.database.insertUnique
-        ? await this.config.database.insertUnique(data, options.unique)
-        : await this.insertUniqueUnsafely(data, options.unique);
+        ? await this.config.database.insertUnique(data, options.unique, options.tx)
+        : await this.insertUniqueUnsafely(data, options.unique, options.tx);
 
       if (result.conflict) {
         telemetry.emit('job:unique_conflict', {
           job: result.job,
           queue: result.job.queue
         });
-      } else if (this.started && this.config.database.notify) {
-        await this.config.database.notify(result.job.queue);
+      } else {
+        await this.wake(result.job.queue, options.tx);
       }
 
       return { job: result.job as Job<T>, conflict: result.conflict };
     }
 
-    const job = await this.config.database.insertJob(jobData as Omit<Job, 'id' | 'insertedAt'>);
+    const job = await this.config.database.insertJob(
+      jobData as Omit<Job, 'id' | 'insertedAt'>,
+      options.tx
+    );
 
-    if (this.started && this.config.database.notify) {
-      await this.config.database.notify(job.queue);
-    }
+    await this.wake(job.queue, options.tx);
 
     return { job: job as Job<T>, conflict: false };
+  }
+
+  /**
+   * Nudges a queue to poll now rather than at its next interval. Passing the
+   * transaction through matters: the notification must not be observable
+   * before the caller commits, or a worker looks for a row that is not there
+   * yet -- and must never fire at all if they roll back.
+   */
+  private async wake(queue: string, tx?: TransactionHandle): Promise<void> {
+    if (!this.started || !this.config.database.notify) return;
+    await this.config.database.notify(queue, tx);
   }
 
   /**
@@ -300,14 +313,15 @@ export class IziQueue {
    */
   private async insertUniqueUnsafely(
     data: Omit<Job, 'id' | 'insertedAt'>,
-    unique: NonNullable<JobInsertOptions['unique']>
+    unique: NonNullable<JobInsertOptions['unique']>,
+    tx?: TransactionHandle
   ): Promise<{ job: Job; conflict: boolean }> {
     if (this.config.database.checkUnique) {
       const existing = await this.config.database.checkUnique(unique, data);
       if (existing) return { job: existing, conflict: true };
     }
 
-    return { job: await this.config.database.insertJob(data), conflict: false };
+    return { job: await this.config.database.insertJob(data, tx), conflict: false };
   }
 
   async insertAll<T = Record<string, unknown>>(

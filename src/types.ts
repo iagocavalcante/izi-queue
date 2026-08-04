@@ -57,6 +57,17 @@ export interface JobCriteria {
   all?: boolean;
 }
 
+/**
+ * A caller-managed transaction handle, passed straight through to the adapter.
+ * Adapter-specific by nature, so the shared type stays open and each adapter
+ * validates what it is given:
+ *
+ * - PostgreSQL: a `PoolClient` with `BEGIN` already issued
+ * - MySQL: a `PoolConnection` with `beginTransaction()` already called
+ * - SQLite: the `Database`, with `BEGIN` issued manually
+ */
+export type TransactionHandle = unknown;
+
 export interface JobInsertOptions<T = Record<string, unknown>> {
   args: T;
   queue?: string;
@@ -66,6 +77,11 @@ export interface JobInsertOptions<T = Record<string, unknown>> {
   meta?: Record<string, unknown>;
   tags?: string[];
   unique?: UniqueOptions;
+  /**
+   * Insert as part of the caller's transaction, so the job is committed or
+   * discarded atomically with their business write.
+   */
+  tx?: TransactionHandle;
 }
 
 export type WorkerResult =
@@ -151,7 +167,7 @@ export interface WorkerThreadMessage {
 
 export interface DatabaseAdapter {
   migrate(): Promise<void>;
-  insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job>;
+  insertJob(job: Omit<Job, 'id' | 'insertedAt'>, tx?: TransactionHandle): Promise<Job>;
   /**
    * Claims up to `limit` available jobs for `queue`, marking them executing.
    * `node` is recorded on each claimed job so orphan rescue can tell a job
@@ -194,11 +210,16 @@ export interface DatabaseAdapter {
    */
   insertUnique?(
     job: Omit<Job, 'id' | 'insertedAt'>,
-    options: UniqueOptions
+    options: UniqueOptions,
+    tx?: TransactionHandle
   ): Promise<{ job: Job; conflict: boolean }>;
   close(): Promise<void>;
   listen?(callback: (event: { queue: string }) => void): Promise<void>;
-  notify?(queue: string): Promise<void>;
+  /**
+   * Wakes queues for `queue`. When a transaction is supplied the notification
+   * must not be observable before it commits.
+   */
+  notify?(queue: string, tx?: TransactionHandle): Promise<void>;
 }
 
 export interface IsolationConfig {

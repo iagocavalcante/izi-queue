@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
-import type { Job, JobCriteria, JobState, UniqueOptions } from '../types.js';
+import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { advisoryLockKey, computeUniqueKey } from '../core/unique.js';
 
@@ -155,8 +155,23 @@ export class PostgresAdapter extends BaseAdapter {
     }));
   }
 
-  async insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job> {
-    const result = await this.pool.query(SQL.postgres.insertJob, [
+  /**
+   * Resolves where a statement should run. With a caller transaction the work
+   * has to go through their client -- the pool would hand back a different
+   * connection, which commits independently of them.
+   */
+  private executor(tx?: TransactionHandle): Pool | PoolClient {
+    if (tx === undefined) return this.pool;
+
+    if (typeof (tx as PoolClient)?.query !== 'function') {
+      throw new Error('izi-queue: the transaction handle must be a pg PoolClient or Client');
+    }
+
+    return tx as PoolClient;
+  }
+
+  async insertJob(job: Omit<Job, 'id' | 'insertedAt'>, tx?: TransactionHandle): Promise<Job> {
+    const result = await this.executor(tx).query(SQL.postgres.insertJob, [
       job.state,
       job.queue,
       job.worker,
@@ -295,17 +310,15 @@ export class PostgresAdapter extends BaseAdapter {
 
   async insertUnique(
     job: Omit<Job, 'id' | 'insertedAt'>,
-    options: UniqueOptions
+    options: UniqueOptions,
+    tx?: TransactionHandle
   ): Promise<{ job: Job; conflict: boolean }> {
     const { states, period } = this.uniqueLookup(options);
     const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
 
-    const client = await this.pool.connect();
-    try {
-      await client.query('BEGIN');
-
-      // Held until commit, so a concurrent caller with the same unique key
-      // waits here and then sees the committed row rather than an empty result.
+    const claim = async (client: Pool | PoolClient): Promise<{ job: Job; conflict: boolean }> => {
+      // Transaction-scoped, so it is held until whoever owns the transaction
+      // commits -- the caller when they supplied one, otherwise us.
       await client.query('SELECT pg_advisory_xact_lock($1)', [advisoryLockKey(uniqueKey)]);
 
       const existing = await client.query(
@@ -314,7 +327,6 @@ export class PostgresAdapter extends BaseAdapter {
       );
 
       if (existing.rows[0]) {
-        await client.query('COMMIT');
         return { job: rowToJob(existing.rows[0]), conflict: true };
       }
 
@@ -333,8 +345,21 @@ export class PostgresAdapter extends BaseAdapter {
         uniqueKey
       ]);
 
-      await client.query('COMMIT');
       return { job: rowToJob(inserted.rows[0]), conflict: false };
+    };
+
+    // Inside the caller's transaction: their BEGIN/COMMIT governs atomicity,
+    // and issuing our own would end their transaction early.
+    if (tx !== undefined) {
+      return claim(this.executor(tx));
+    }
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await claim(client);
+      await client.query('COMMIT');
+      return result;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       throw error;
@@ -362,9 +387,12 @@ export class PostgresAdapter extends BaseAdapter {
     });
   }
 
-  async notify(queue: string): Promise<void> {
+  async notify(queue: string, tx?: TransactionHandle): Promise<void> {
     const payload = JSON.stringify({ queue });
-    await this.pool.query('SELECT pg_notify($1, $2)', ['izi_jobs_insert', payload]);
+    // Issued on the caller's connection when there is one. PostgreSQL defers
+    // NOTIFY until commit and discards it on rollback, so the wake-up inherits
+    // the transaction's fate for free.
+    await this.executor(tx).query('SELECT pg_notify($1, $2)', ['izi_jobs_insert', payload]);
   }
 
   async close(): Promise<void> {

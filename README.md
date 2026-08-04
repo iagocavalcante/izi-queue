@@ -11,14 +11,11 @@ A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](ht
 ## Why izi-queue?
 
 - **No extra infrastructure** - Use your existing PostgreSQL, SQLite, or MySQL database
+- **Transactional** - Enqueue inside your own transaction, so a job never outlives the write it belongs to
 - **Durable** - Jobs live in your database, survive restarts, and are recovered when a node dies
 - **Simple API** - Define workers, insert jobs, done
 - **TypeScript-first** - Full type safety and excellent DX
 - **Battle-tested patterns** - Inspired by Oban's proven design
-
-> **Not yet supported:** inserting a job inside your own transaction. Every insert
-> currently commits on its own connection, so a job can outlive a rolled-back
-> business write. Tracked in [#21](https://github.com/iagocavalcante/izi-queue/issues/21).
 
 ## Table of Contents
 
@@ -33,6 +30,7 @@ A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](ht
   - [Plugins](#plugins)
   - [Telemetry](#telemetry)
 - [Managing Jobs](#managing-jobs)
+- [Transactional Inserts](#transactional-inserts)
 - [Migrations](#migrations)
 - [Running Multiple Nodes](#running-multiple-nodes)
 - [Worker Results](#worker-results)
@@ -304,6 +302,59 @@ await queue.cancelJobs({ all: true });
 Cancelling a job that is currently executing marks it cancelled and causes its
 result to be discarded when the worker finishes. It does **not** interrupt the
 worker mid-run ([#30](https://github.com/iagocavalcante/izi-queue/issues/30)).
+
+## Transactional Inserts
+
+Pass your open transaction as `tx` and the job is committed or discarded with
+the rest of your work. No job for an order that was never placed, and no job
+that becomes visible before the row it refers to.
+
+```typescript
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+
+  const { rows } = await client.query(
+    'INSERT INTO orders (total) VALUES ($1) RETURNING id',
+    [total]
+  );
+
+  await queue.insert('send_receipt', {
+    args: { orderId: rows[0].id },
+    tx: client,          // same connection, same transaction
+  });
+
+  await client.query('COMMIT');
+} catch (error) {
+  await client.query('ROLLBACK');   // the job goes with it
+  throw error;
+} finally {
+  client.release();
+}
+```
+
+The handle is whatever your driver uses for a transaction:
+
+| Adapter | Pass as `tx` | Transaction opened with |
+| --- | --- | --- |
+| PostgreSQL | `PoolClient` | `client.query('BEGIN')` |
+| MySQL | `PoolConnection` | `connection.beginTransaction()` |
+| SQLite | the `Database` | `db.exec('BEGIN')` |
+
+On PostgreSQL the wake-up notification is issued on your connection too, so a
+worker is never nudged toward a row that has not committed yet, and is not
+nudged at all if you roll back.
+
+**SQLite** has a single connection, so any insert while a transaction is open is
+already part of it; passing `tx` makes that explicit and catches the mistake of
+handing over a different database. Use `db.exec('BEGIN')` rather than
+`db.transaction()`, which is synchronous and cannot await.
+
+**MySQL** cannot combine `unique` with a caller-managed transaction and will
+throw if you try. Its advisory lock is connection-scoped and cannot be held
+across your commit, which would leave a window for a concurrent node to insert a
+duplicate. Insert unique jobs outside the transaction, or use PostgreSQL, where
+the lock is transaction-scoped.
 
 ## Migrations
 

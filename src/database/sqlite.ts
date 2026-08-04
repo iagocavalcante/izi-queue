@@ -1,5 +1,5 @@
 import type { Database } from 'better-sqlite3';
-import type { Job, JobCriteria, JobState, UniqueOptions } from '../types.js';
+import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_NODE_TTL, criteriaClause, rowToJob } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 import { sqliteMigrations } from './migrations.js';
@@ -74,7 +74,22 @@ export class SQLiteAdapter extends BaseAdapter {
     }));
   }
 
-  async insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job> {
+  /**
+   * better-sqlite3 has a single connection, so any statement issued while a
+   * transaction is open is already part of it. The handle exists to make that
+   * explicit at the call site and to catch the mistake of passing a different
+   * database, which would silently commit outside the caller's transaction.
+   */
+  private resolveTx(tx?: TransactionHandle): void {
+    if (tx !== undefined && tx !== this.db) {
+      throw new Error(
+        'izi-queue: the transaction handle must be the same database the adapter was created with'
+      );
+    }
+  }
+
+  async insertJob(job: Omit<Job, 'id' | 'insertedAt'>, tx?: TransactionHandle): Promise<Job> {
+    this.resolveTx(tx);
     const stmt = this.db.prepare(`
       INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at, unique_key)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -297,21 +312,30 @@ export class SQLiteAdapter extends BaseAdapter {
 
   async insertUnique(
     job: Omit<Job, 'id' | 'insertedAt'>,
-    options: UniqueOptions
+    options: UniqueOptions,
+    tx?: TransactionHandle
   ): Promise<{ job: Job; conflict: boolean }> {
+    this.resolveTx(tx);
+
     const { states, period } = this.uniqueLookup(options);
     const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
+
+    const claim = (): { job: Job; conflict: boolean } => {
+      const existing = this.findUnique(uniqueKey, states, period);
+      if (existing) return { job: existing, conflict: true };
+      return { job: this.insertJobSync({ ...job, uniqueKey }), conflict: false };
+    };
+
+    // Already inside the caller's transaction: opening another would fail, and
+    // their transaction is what makes the check-and-insert atomic.
+    if (tx !== undefined || this.db.inTransaction) {
+      return claim();
+    }
 
     // `immediate` takes the write lock up front. A deferred transaction would
     // start as a reader and only try to upgrade at the INSERT, which SQLite
     // refuses outright rather than waiting when another writer got there first.
-    const run = this.db.transaction(() => {
-      const existing = this.findUnique(uniqueKey, states, period);
-      if (existing) return { job: existing, conflict: true };
-      return { job: this.insertJobSync({ ...job, uniqueKey }), conflict: false };
-    });
-
-    return run.immediate();
+    return this.db.transaction(claim).immediate();
   }
 
   private insertJobSync(job: Omit<Job, 'id' | 'insertedAt'>): Job {

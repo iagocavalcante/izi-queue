@@ -23,7 +23,7 @@ interface Pool {
   getConnection(): Promise<PoolConnection>;
   end(): Promise<void>;
 }
-import type { Job, JobCriteria, JobState, UniqueOptions } from '../types.js';
+import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 
@@ -123,8 +123,24 @@ export class MySQLAdapter extends BaseAdapter {
     }));
   }
 
-  async insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job> {
-    const [result] = await this.pool.query<ResultSetHeader>(SQL.mysql.insertJob, [
+  /**
+   * Resolves where a statement should run. With a caller transaction the work
+   * has to go through their connection -- the pool would hand back a different
+   * one, which commits independently of them.
+   */
+  private executor(tx?: TransactionHandle): Pool | PoolConnection {
+    if (tx === undefined) return this.pool;
+
+    if (typeof (tx as PoolConnection)?.query !== 'function') {
+      throw new Error('izi-queue: the transaction handle must be a mysql2 PoolConnection');
+    }
+
+    return tx as PoolConnection;
+  }
+
+  async insertJob(job: Omit<Job, 'id' | 'insertedAt'>, tx?: TransactionHandle): Promise<Job> {
+    const executor = this.executor(tx);
+    const [result] = await executor.query<ResultSetHeader>(SQL.mysql.insertJob, [
       job.state,
       job.queue,
       job.worker,
@@ -139,11 +155,13 @@ export class MySQLAdapter extends BaseAdapter {
       job.uniqueKey ?? null
     ]);
 
-    const insertedJob = await this.getJob(result.insertId);
-    if (!insertedJob) {
+    // Read back through the same executor: an uncommitted row is invisible to
+    // any other connection, so going via the pool would find nothing.
+    const [rows] = await executor.query<RowDataPacket[]>(SQL.mysql.getJob, [result.insertId]);
+    if (!rows[0]) {
       throw new Error('Failed to retrieve inserted job');
     }
-    return insertedJob;
+    return rowToJob(rows[0] as Record<string, unknown>);
   }
 
   async fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]> {
@@ -314,8 +332,22 @@ export class MySQLAdapter extends BaseAdapter {
 
   async insertUnique(
     job: Omit<Job, 'id' | 'insertedAt'>,
-    options: UniqueOptions
+    options: UniqueOptions,
+    tx?: TransactionHandle
   ): Promise<{ job: Job; conflict: boolean }> {
+    if (tx !== undefined) {
+      // MySQL's GET_LOCK is connection-scoped and not transactional, so it
+      // cannot be held across the caller's commit. Releasing it at insert time
+      // would leave a window for a concurrent node to insert a duplicate --
+      // reintroducing the exact race that atomic insertion exists to close.
+      // Degrading silently would be worse than refusing.
+      throw new Error(
+        'izi-queue: unique jobs cannot be inserted inside a caller-managed transaction on MySQL, ' +
+          'because the advisory lock cannot span the commit. Insert unique jobs outside the ' +
+          'transaction, or use PostgreSQL, where the lock is transaction-scoped.'
+      );
+    }
+
     const { states, period } = this.uniqueLookup(options);
     const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
     // GET_LOCK names are capped at 64 characters; the digest is 32.
