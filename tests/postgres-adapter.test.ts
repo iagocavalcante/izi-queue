@@ -1,5 +1,6 @@
 import pg from 'pg';
 import { randomBytes } from 'crypto';
+import { waitFor } from './helpers/wait.js';
 import { createPostgresAdapter, PostgresAdapter } from '../src/database/postgres.js';
 import type { Job } from '../src/types.js';
 
@@ -393,5 +394,47 @@ describePostgres('PostgresAdapter', () => {
       const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
       expect(rows[0].count).toBe(1);
     });
+  });
+
+  describe('listener resilience', () => {
+    it('re-subscribes after its connection is dropped', async () => {
+      const listenerAdapter = createPostgresAdapter(new pg.Pool({ connectionString: CONNECTION_STRING }));
+      const received: string[] = [];
+
+      try {
+        await listenerAdapter.listen(({ queue }) => received.push(queue));
+
+        // Sanity: notifications arrive before anything is broken.
+        await adapter.notify('before');
+        await waitFor(() => received.includes('before'), {
+          describe: 'the first notification',
+        });
+
+        // Kill the listener's backend from another connection, the way a
+        // failover, an idle-connection reaper or a network blip would.
+        const { rows } = await pool.query(
+          `SELECT pid FROM pg_stat_activity
+           WHERE query LIKE 'LISTEN%' AND pid <> pg_backend_pid()`
+        );
+        expect(rows.length).toBeGreaterThan(0);
+        for (const row of rows) {
+          await pool.query('SELECT pg_terminate_backend($1)', [row.pid]);
+        }
+
+        // Without re-subscribing, notifications are silently lost from here on
+        // and the queue degrades to poll-only with no indication.
+        await waitFor(
+          async () => {
+            await adapter.notify('after');
+            return received.includes('after');
+          },
+          { timeout: 20000, interval: 500, describe: 'notifications to resume' }
+        );
+
+        expect(received).toContain('after');
+      } finally {
+        await listenerAdapter.close().catch(() => {});
+      }
+    }, 40000);
   });
 });

@@ -1,5 +1,6 @@
 import { join } from 'path';
 import { ThreadPool } from '../../src/core/isolation/thread-pool.js';
+import { waitFor } from '../helpers/wait.js';
 import type { SerializableJob, IsolatedWorkerOptions } from '../../src/types.js';
 
 const TEST_WORKER_PATH = join(__dirname, '../fixtures/test-isolated-worker.js');
@@ -265,31 +266,115 @@ describe('ThreadPool', () => {
       expect(results.filter(r => r.status === 'ok').length).toBe(2);
     });
 
-    it('should return error when no threads available', async () => {
+    it('should queue rather than error when no threads are free', async () => {
+      // Superseded behaviour: this used to assert that a saturated pool
+      // returned an error, which consumed one of the job's retry attempts for
+      // something it had no part in. It now waits for a thread.
       pool = new ThreadPool({ maxThreads: 1 });
       const options = createIsolationOptions();
 
-      // Start one long-running job
-      const longJob = createSerializableJob({
-        id: 1,
-        args: { action: 'delay', delay: 2000 }
-      });
-      pool.execute(longJob, options, 5000);
+      const longJob = createSerializableJob({ id: 1, args: { action: 'delay', delay: 300 } });
+      const first = pool.execute(longJob, options, 10000);
 
-      // Wait for thread to be busy
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await waitFor(() => pool.getStats().busyWorkers === 1, { describe: 'the pool to be busy' });
 
-      // Try to start another job - should fail since thread is busy
-      const shortJob = createSerializableJob({
-        id: 2,
-        args: { action: 'success' }
-      });
-      const result = await pool.execute(shortJob, options, 1000);
+      const shortJob = createSerializableJob({ id: 2, args: { action: 'success' } });
+      const second = await pool.execute(shortJob, options, 10000);
 
-      expect(result.status).toBe('error');
-      if (result.status === 'error') {
-        expect((result.error as Error).message).toContain('No available worker threads');
+      expect(second.status).toBe('ok');
+      expect((await first).status).toBe('ok');
+  });
+  });
+
+  describe('saturation', () => {
+    it('queues jobs instead of failing them when every thread is busy', async () => {
+      // A job that arrives while the pool is full has not failed -- it has not
+      // started. Returning an error consumes one of its retry attempts for
+      // something the job had no part in.
+      pool = new ThreadPool({ maxThreads: 1 });
+
+      const jobs = Array.from({ length: 3 }, (_, i) =>
+        createSerializableJob({ id: i + 1, args: { action: 'delay', delay: 60 } })
+      );
+      const options = createIsolationOptions();
+
+      const results = await Promise.all(jobs.map(job => pool.execute(job, options, 10000)));
+
+      expect(results.every(r => r.status === 'ok')).toBe(true);
+      const errors = results
+        .filter((r): r is { status: 'error'; error: Error } => r.status === 'error')
+        .map(r => r.error.message);
+      expect(errors).toEqual([]);
+    }, 20000);
+
+    it('runs queued jobs one at a time on a single-thread pool', async () => {
+      pool = new ThreadPool({ maxThreads: 1 });
+
+      const jobs = Array.from({ length: 3 }, (_, i) =>
+        createSerializableJob({ id: i + 1, args: { action: 'delay', delay: 60 } })
+      );
+      const options = createIsolationOptions();
+
+      const results = await Promise.all(jobs.map(job => pool.execute(job, options, 10000)));
+      const runs = results.map(
+        r => (r as { status: 'ok'; value: { startedAt: number; finishedAt: number } }).value
+      );
+
+      const overlapping = runs.some((a, i) =>
+        runs.some((b, j) => i !== j && a.startedAt < b.finishedAt && b.startedAt < a.finishedAt)
+      );
+      expect(overlapping).toBe(false);
+    }, 20000);
+
+    it('reports a distinct error when a job gives up waiting for a thread', async () => {
+      pool = new ThreadPool({ maxThreads: 1 });
+      const options = createIsolationOptions();
+
+      const blocker = pool.execute(
+        createSerializableJob({ id: 1, args: { action: 'delay', delay: 2000 } }),
+        options,
+        10000
+      );
+
+      const queued = await pool.execute(
+        createSerializableJob({ id: 2, args: { action: 'success' } }),
+        options,
+        150
+      );
+
+      expect(queued.status).toBe('error');
+      if (queued.status === 'error') {
+        expect((queued.error as Error).message).toMatch(/waiting for a worker thread/i);
       }
-    });
+
+      await blocker;
+    }, 20000);
+  });
+
+  describe('resource limits', () => {
+    it('applies the configured heap cap to the worker thread', async () => {
+      pool = new ThreadPool({ maxThreads: 1 });
+
+      const job = createSerializableJob({ args: { action: 'allocate', megabytes: 128 } });
+      const options = createIsolationOptions({
+        resourceLimits: { maxOldGenerationSizeMb: 16 }
+      });
+
+      const result = await pool.execute(job, options, 20000);
+
+      // 128MB of live buffers cannot fit in a 16MB heap: the thread must die
+      // rather than the allocation quietly succeeding.
+      expect(result.status).toBe('error');
+    }, 30000);
+
+    it('runs the same work fine without a cap', async () => {
+      pool = new ThreadPool({ maxThreads: 1 });
+
+      const job = createSerializableJob({ args: { action: 'allocate', megabytes: 128 } });
+
+      const result = await pool.execute(job, createIsolationOptions(), 20000);
+
+      expect(result.status).toBe('ok');
+    }, 30000);
   });
 });
