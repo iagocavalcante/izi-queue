@@ -41,16 +41,19 @@ export const SQL = {
       RETURNING *
     `,
     fetchJobs: `
-      UPDATE izi_jobs
-      SET state = 'executing', attempted_at = NOW(), attempt = attempt + 1, attempted_by = $3
-      WHERE id IN (
-        SELECT id FROM izi_jobs
-        WHERE queue = $1 AND state = 'available'
-        ORDER BY priority ASC, scheduled_at ASC, id ASC
-        LIMIT $2
-        FOR UPDATE SKIP LOCKED
+      WITH claimed AS (
+        UPDATE izi_jobs
+        SET state = 'executing', attempted_at = NOW(), attempt = attempt + 1, attempted_by = $3
+        WHERE id IN (
+          SELECT id FROM izi_jobs
+          WHERE queue = $1 AND state = 'available'
+          ORDER BY priority ASC, scheduled_at ASC, id ASC
+          LIMIT $2
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
       )
-      RETURNING *
+      SELECT * FROM claimed ORDER BY priority ASC, scheduled_at ASC, id ASC
     `,
     updateJob: `
       UPDATE izi_jobs
