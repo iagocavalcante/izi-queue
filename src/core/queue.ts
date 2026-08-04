@@ -12,6 +12,8 @@ export class Queue {
   private running: Map<number, Promise<void>> = new Map();
   private isolatedJobs: Set<number> = new Set();
   private pollTimer?: ReturnType<typeof setTimeout>;
+  private polling = false;
+  private pollInFlight?: Promise<void>;
   private node: string;
 
   constructor(config: QueueConfig, database: DatabaseAdapter, node: string) {
@@ -56,6 +58,13 @@ export class Queue {
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = undefined;
+    }
+
+    // A poll may already have claimed jobs in the database. Let it finish
+    // handing them to `running` so they are covered by the grace period below,
+    // rather than starting after shutdown against a closing connection.
+    if (this.pollInFlight) {
+      await this.pollInFlight.catch(() => {});
     }
 
     if (this.running.size > 0) {
@@ -108,7 +117,19 @@ export class Queue {
     this.poll();
   }
 
+  /**
+   * Schedules the next poll, replacing any pending one.
+   *
+   * Always clearing first is what keeps a single poll loop per queue: `dispatch()`
+   * can be called arbitrarily often (once per NOTIFY, i.e. once per insert) and
+   * each call must move the existing loop rather than start a new one.
+   */
   private schedulePoll(): void {
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = undefined;
+    }
+
     if (this.state !== 'running') return;
 
     const interval = this.config.pollInterval ?? 1000;
@@ -118,14 +139,29 @@ export class Queue {
   private async poll(): Promise<void> {
     if (this.state !== 'running') return;
 
-    const available = this.config.limit - this.running.size;
-    if (available <= 0) {
-      this.schedulePoll();
-      return;
-    }
+    // A fetch is already in flight. Returning here is safe: the in-flight poll
+    // reschedules when it finishes, and it is fetching current work anyway.
+    // Without this guard, concurrent polls each size their fetch from a stale
+    // `running.size` and together overshoot the queue's concurrency limit.
+    if (this.polling) return;
+    this.polling = true;
+    this.pollInFlight = this.fetchAndStart();
 
     try {
-      const jobs = await this.database.fetchJobs(this.name, available);
+      await this.pollInFlight;
+    } finally {
+      this.pollInFlight = undefined;
+      this.polling = false;
+      this.schedulePoll();
+    }
+  }
+
+  private async fetchAndStart(): Promise<void> {
+    try {
+      const available = this.config.limit - this.running.size;
+      if (available <= 0) return;
+
+      const jobs = await this.database.fetchJobs(this.name, available, this.node);
 
       for (const job of jobs) {
         const promise = this.execute(job);
@@ -135,11 +171,22 @@ export class Queue {
     } catch (error) {
       console.error(`[izi-queue] Error fetching jobs for queue "${this.name}":`, error);
     }
-
-    this.schedulePoll();
   }
 
   private async execute(job: Job): Promise<void> {
+    try {
+      await this.runJob(job);
+    } catch (error) {
+      // Recording the outcome failed (a dropped connection, a closing pool).
+      // The job stays `executing` in the database and the Lifeline plugin
+      // returns it to the queue once this node stops heartbeating. What must
+      // not happen is rejecting: nothing awaits this promise, so it would
+      // surface as an unhandled rejection and take the process down.
+      console.error(`[izi-queue] Failed to record outcome for job ${job.id}:`, error);
+    }
+  }
+
+  private async runJob(job: Job): Promise<void> {
     const startTime = Date.now();
 
     telemetry.emit('job:start', { job, queue: this.name });
