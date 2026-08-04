@@ -301,4 +301,68 @@ describeMySQL('MySQLAdapter', () => {
       }
     });
   });
+
+  describe('transactional insert', () => {
+    it('discards the job when the caller rolls back', async () => {
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await adapter.insertJob(jobData({ args: { orderId: 1 } }), conn);
+        await conn.rollback();
+      } finally {
+        conn.release();
+      }
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(0);
+    });
+
+    it('keeps the job when the caller commits', async () => {
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await adapter.insertJob(jobData({ args: { orderId: 1 } }), conn);
+        await conn.commit();
+      } finally {
+        conn.release();
+      }
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(1);
+    });
+
+    it('does not make the job visible to other connections before commit', async () => {
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await adapter.insertJob(jobData(), conn);
+
+        expect(await adapter.fetchJobs('default', 5, 'node-a')).toHaveLength(0);
+
+        await conn.commit();
+      } finally {
+        conn.release();
+      }
+
+      expect(await adapter.fetchJobs('default', 5, 'node-a')).toHaveLength(1);
+    });
+
+    it('refuses a unique insert inside a caller transaction rather than weakening the guarantee', async () => {
+      // GET_LOCK is connection-scoped and not transactional, so it cannot be
+      // held across the caller's commit. Releasing it at insert time would let
+      // a concurrent node insert a duplicate -- exactly the race that was fixed
+      // for the non-transactional path. Refusing is honest; silently degrading
+      // is not.
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await expect(
+          adapter.insertUnique(jobData({ args: { userId: 1 } }), { period: 60 }, conn)
+        ).rejects.toThrow(/unique/i);
+        await conn.rollback();
+      } finally {
+        conn.release();
+      }
+    });
+  });
 });

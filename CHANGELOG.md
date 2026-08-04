@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below 1.0.0, breaking changes are released as minor versions.
 
+## [Unreleased]
+
+### Added
+
+- **Transactional inserts.** Pass your open transaction as `tx` and the job is
+  committed or discarded atomically with your business write:
+
+  ```typescript
+  await client.query('BEGIN');
+  const { rows } = await client.query('INSERT INTO orders ... RETURNING id');
+  await queue.insert('send_receipt', { args: { orderId: rows[0].id }, tx: client });
+  await client.query('COMMIT');
+  ```
+
+  This closes the gap that made the README's original "ACID guarantees" claim
+  false: every insert previously committed on its own connection, so a job could
+  outlive a rolled-back write, or become visible to a worker before the row it
+  referred to. ([#21])
+
+  On PostgreSQL the wake-up notification is issued on the caller's connection,
+  so `NOTIFY` inherits the transaction's fate -- deferred until commit, dropped
+  on rollback. Unique inserts also participate: the advisory lock is
+  transaction-scoped, so it is held until the caller commits.
+
+  MySQL **refuses** `unique` inside a caller-managed transaction rather than
+  silently weakening it. `GET_LOCK` is connection-scoped and cannot be held
+  across the caller's commit, which would reopen the duplicate-insert race that
+  atomic insertion exists to close.
+
+### Changed
+
+- `DatabaseAdapter.insertJob`, `insertUnique` and `notify` accept an optional
+  transaction handle. All three parameters are optional, so existing adapters
+  continue to compile.
+
 ## [0.5.0] - 2026-08-04
 
 ### Fixed
@@ -231,6 +266,7 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#19]: https://github.com/iagocavalcante/izi-queue/issues/19
 [#20]: https://github.com/iagocavalcante/izi-queue/issues/20
 [#25]: https://github.com/iagocavalcante/izi-queue/issues/25
+[#21]: https://github.com/iagocavalcante/izi-queue/issues/21
 [#28]: https://github.com/iagocavalcante/izi-queue/issues/28
 [#41]: https://github.com/iagocavalcante/izi-queue/issues/41
 [#42]: https://github.com/iagocavalcante/izi-queue/issues/42

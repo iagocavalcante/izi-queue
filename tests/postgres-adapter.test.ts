@@ -257,4 +257,141 @@ describePostgres('PostgresAdapter', () => {
       }
     });
   });
+
+  describe('transactional insert', () => {
+    it('discards the job when the caller rolls back', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await adapter.insertJob(jobData({ args: { orderId: 1 } }), client);
+        await client.query('ROLLBACK');
+      } finally {
+        client.release();
+      }
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(0);
+    });
+
+    it('keeps the job when the caller commits', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await adapter.insertJob(jobData({ args: { orderId: 1 } }), client);
+        await client.query('COMMIT');
+      } finally {
+        client.release();
+      }
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(1);
+    });
+
+    it('does not make the job visible to other connections before commit', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await adapter.insertJob(jobData(), client);
+
+        // A worker on another connection must not be able to claim it yet.
+        const claimedEarly = await adapter.fetchJobs('default', 5, 'node-a');
+        expect(claimedEarly).toHaveLength(0);
+
+        await client.query('COMMIT');
+      } finally {
+        client.release();
+      }
+
+      const claimedAfter = await adapter.fetchJobs('default', 5, 'node-a');
+      expect(claimedAfter).toHaveLength(1);
+    });
+
+    it('holds the wake-up notification until commit', async () => {
+      const listener = await pool.connect();
+      const received: string[] = [];
+      try {
+        await listener.query('LISTEN izi_jobs_insert');
+        listener.on('notification', msg => received.push(msg.payload ?? ''));
+
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await adapter.insertJob(jobData(), client);
+          await adapter.notify('default', client);
+
+          // PostgreSQL defers NOTIFY until commit, which is exactly what is
+          // wanted: waking a worker early sends it looking for an invisible row.
+          await new Promise(resolve => setTimeout(resolve, 150));
+          expect(received).toHaveLength(0);
+
+          await client.query('COMMIT');
+        } finally {
+          client.release();
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 250));
+        expect(received.length).toBeGreaterThan(0);
+      } finally {
+        await listener.query('UNLISTEN izi_jobs_insert');
+        listener.release();
+      }
+    });
+
+    it('drops the notification entirely when the caller rolls back', async () => {
+      const listener = await pool.connect();
+      const received: string[] = [];
+      try {
+        await listener.query('LISTEN izi_jobs_insert');
+        listener.on('notification', msg => received.push(msg.payload ?? ''));
+
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          await adapter.insertJob(jobData(), client);
+          await adapter.notify('default', client);
+          await client.query('ROLLBACK');
+        } finally {
+          client.release();
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 250));
+        expect(received).toHaveLength(0);
+      } finally {
+        await listener.query('UNLISTEN izi_jobs_insert');
+        listener.release();
+      }
+    });
+
+    it('rolls a unique job back with its transaction, leaving no phantom conflict', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await adapter.insertUnique(jobData({ args: { userId: 1 } }), { period: 60 }, client);
+        await client.query('ROLLBACK');
+      } finally {
+        client.release();
+      }
+
+      const after = await adapter.insertUnique(jobData({ args: { userId: 1 } }), { period: 60 });
+      expect(after.conflict).toBe(false);
+    });
+
+    it('still deduplicates unique jobs inside a transaction', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const first = await adapter.insertUnique(jobData({ args: { userId: 1 } }), { period: 60 }, client);
+        const second = await adapter.insertUnique(jobData({ args: { userId: 1 } }), { period: 60 }, client);
+        await client.query('COMMIT');
+
+        expect(first.conflict).toBe(false);
+        expect(second.conflict).toBe(true);
+      } finally {
+        client.release();
+      }
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(1);
+    });
+  });
 });
