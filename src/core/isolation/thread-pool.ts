@@ -1,6 +1,7 @@
 import { Worker } from 'worker_threads';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { existsSync } from 'fs';
+import { join } from 'path';
+import { isolationDir } from './worker-path.js';
 import type {
   IsolatedWorkerOptions,
   SerializableJob,
@@ -9,44 +10,18 @@ import type {
 } from '../../types.js';
 import { telemetry } from '../telemetry.js';
 
+/** Locates the compiled worker thread entry point next to this module. */
 function getWorkerThreadPath(): string {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const fs = require('fs');
+  const path = join(isolationDir(), 'worker-thread.js');
 
-  // CommonJS environment (Jest and some Node.js setups)
-  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-  // @ts-ignore - __dirname may not be available in ESM
-  if (typeof __dirname !== 'undefined') {
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore - __dirname available in CommonJS
-    let workerPath = join(__dirname, 'worker-thread.js');
-
-    // If running from source (e.g., Jest), try to find the compiled version in dist
-    if (!fs.existsSync(workerPath)) {
-      // Try dist path - src/core/isolation -> dist/core/isolation
-      // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-      // @ts-ignore - __dirname available in CommonJS
-      const distPath = __dirname.replace('/src/', '/dist/').replace('\\src\\', '\\dist\\');
-      const distWorkerPath = join(distPath, 'worker-thread.js');
-      if (fs.existsSync(distWorkerPath)) {
-        workerPath = distWorkerPath;
-      }
-    }
-
-    return workerPath;
+  if (!existsSync(path)) {
+    throw new Error(
+      `izi-queue: could not find the isolated worker entry point at ${path}. ` +
+        'If you are running from source, build the package first.'
+    );
   }
 
-  // ESM environment - use dynamic evaluation to avoid parser errors in CJS
-  // eslint-disable-next-line no-eval
-  const getMetaUrl = new Function('return import.meta.url');
-  try {
-    const currentUrl = getMetaUrl();
-    const currentFilename = fileURLToPath(currentUrl);
-    const currentDirname = dirname(currentFilename);
-    return join(currentDirname, 'worker-thread.js');
-  } catch {
-    throw new Error('Cannot determine worker thread path - neither __dirname nor import.meta.url available');
-  }
+  return path;
 }
 
 let WORKER_THREAD_PATH: string;

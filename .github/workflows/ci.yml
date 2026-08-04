@@ -123,3 +123,56 @@ jobs:
             if (typeof m.IziQueue !== 'function') { throw new Error('entry point did not resolve'); }
             console.log('izi-queue resolves, exports', Object.keys(m).length, 'symbols');
           })"
+
+      # The unit tests run under CommonJS, so they cannot catch ESM-only
+      # breakage. Worker isolation shipped broken for exactly that reason: the
+      # published package is ESM, and the path resolver used `require`. This
+      # runs a real isolated job through the packed tarball.
+      - name: Run an isolated job through the packed tarball
+        run: |
+          cd /tmp/consumer
+          mkdir -p workers
+          cat > workers/double.js <<'WORKER'
+          export async function perform(job) {
+            return { status: 'ok', value: { doubled: job.args.n * 2 } };
+          }
+          WORKER
+          cat > isolation-check.mjs <<'CHECK'
+          import Database from 'better-sqlite3';
+          import { IziQueue, defineWorker, createSQLiteAdapter } from 'izi-queue';
+          import { join } from 'path';
+
+          const queue = new IziQueue({
+            database: createSQLiteAdapter(new Database(':memory:')),
+            queues: { default: 2 },
+            pollInterval: 50,
+            stageInterval: 50,
+            isolation: { maxThreads: 2 },
+          });
+
+          queue.register(defineWorker('double', async () => ({ status: 'ok' }), {
+            isolation: { isolated: true, workerPath: join(process.cwd(), 'workers/double.js') },
+          }));
+
+          await queue.migrate();
+          await queue.start();
+          const job = await queue.insert('double', { args: { n: 21 } });
+
+          const deadline = Date.now() + 15000;
+          let final;
+          while (Date.now() < deadline) {
+            final = await queue.getJob(job.id);
+            if (final && final.state !== 'available' && final.state !== 'executing') break;
+            await new Promise(r => setTimeout(r, 50));
+          }
+
+          await queue.stop();
+
+          if (final?.state !== 'completed') {
+            console.error('isolated job did not complete:', final?.state, final?.errors?.[0]?.error);
+            process.exit(1);
+          }
+          console.log('isolated job completed in an ESM consumer');
+          process.exit(0);
+          CHECK
+          node isolation-check.mjs

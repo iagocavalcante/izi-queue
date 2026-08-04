@@ -143,17 +143,28 @@ describe('ThreadPool', () => {
       );
       const options = createIsolationOptions();
 
-      const startTime = Date.now();
       const results = await Promise.all(
         jobs.map(job => pool.execute(job, options, 5000))
       );
-      const elapsed = Date.now() - startTime;
 
-      // All jobs should complete
       expect(results.every(r => r.status === 'ok')).toBe(true);
 
-      // Should complete in roughly the time of one job since they run in parallel
-      expect(elapsed).toBeLessThan(400); // Allow some overhead
+      // Parallelism is asserted from what the workers report, not from how long
+      // the batch took. A wall-clock ceiling has to cover spawning four threads
+      // as well as the work itself, so on a loaded machine it fails for reasons
+      // that have nothing to do with whether the jobs ran in parallel.
+      const runs = results.map(
+        r => (r as { status: 'ok'; value: { threadId: number; startedAt: number; finishedAt: number } }).value
+      );
+
+      // Spread across the pool rather than queued onto one thread.
+      expect(new Set(runs.map(r => r.threadId)).size).toBeGreaterThan(1);
+
+      // And genuinely overlapping in time, not merely on different threads.
+      const overlapping = runs.some((a, i) =>
+        runs.some((b, j) => i !== j && a.startedAt < b.finishedAt && b.startedAt < a.finishedAt)
+      );
+      expect(overlapping).toBe(true);
     });
   });
 
