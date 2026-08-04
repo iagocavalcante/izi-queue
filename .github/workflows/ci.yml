@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint and typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22, 24]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: izi
+          POSTGRES_DB: izi
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: izi
+          MYSQL_DATABASE: izi
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pizi"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # The isolation tests load the compiled worker-thread entry point, so the
+      # build has to happen before the suite runs.
+      - run: npm run build
+
+      - name: Test (all three adapters)
+        run: npm test
+        env:
+          IZI_TEST_POSTGRES_URL: postgres://postgres:izi@localhost:5432/izi
+          IZI_TEST_MYSQL_URL: mysql://root:izi@localhost:3306/izi
+
+  peer-range:
+    name: better-sqlite3 ${{ matrix.better-sqlite3 }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keeps the declared peerDependencies range honest. The dev dependency
+        # drifting past it is exactly how #50 shipped: every test ran against
+        # v12 while the package told users it needed ^9.
+        better-sqlite3: ['11', '12', '13']
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm install --no-save better-sqlite3@^${{ matrix.better-sqlite3 }}.0.0
+      - run: npm run build
+      - name: SQLite suites
+        run: npx jest tests/sqlite-adapter.test.ts tests/retry.test.ts tests/rescue.test.ts tests/lifecycle.test.ts
+
+  pack:
+    name: Package installs cleanly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm pack --pack-destination /tmp
+
+      # Guards the failure mode from #50, where the published package could not
+      # be installed at all next to a current better-sqlite3.
+      - name: Install the tarball into a clean project
+        run: |
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y > /dev/null
+          npm pkg set type=module > /dev/null
+          npm install /tmp/izi-queue-*.tgz better-sqlite3
+          node -e "import('izi-queue').then(m => {
+            if (typeof m.IziQueue !== 'function') { throw new Error('entry point did not resolve'); }
+            console.log('izi-queue resolves, exports', Object.keys(m).length, 'symbols');
+          })"

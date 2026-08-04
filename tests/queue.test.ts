@@ -8,6 +8,7 @@ import {
   clearWorkers
 } from '../src/index.js';
 import { telemetry } from '../src/core/telemetry.js';
+import { waitFor } from './helpers/wait.js';
 import type { QueueConfig, Job } from '../src/types.js';
 
 describe('Queue Class', () => {
@@ -609,11 +610,20 @@ describe('Queue Class', () => {
 
     it('should timeout if jobs take too long during stop', async () => {
       let jobCompleted = false;
+      // The job is deliberately abandoned by the short grace period. It still
+      // has to be released before the suite ends: leaving it suspended keeps
+      // both its own timer and executeWorker's timeout race pending, which
+      // holds the process open long after the tests finish.
+      let jobTimer: ReturnType<typeof setTimeout> | undefined;
+      let releaseJob: (() => void) | undefined;
 
       registerWorker({
         name: 'VeryLongWorker',
         perform: async () => {
-          await new Promise(resolve => setTimeout(resolve, 2000));
+          await new Promise<void>(resolve => {
+            releaseJob = resolve;
+            jobTimer = setTimeout(resolve, 2000);
+          });
           jobCompleted = true;
           return WorkerResults.ok();
         }
@@ -625,13 +635,17 @@ describe('Queue Class', () => {
       await adapter.insertJob(createJobData({ worker: 'VeryLongWorker' }));
 
       await queue.start();
-      await new Promise(resolve => setTimeout(resolve, 50)); // Let job start
+      await waitFor(() => queue.runningCount > 0, { describe: 'the job to start' });
 
       // Stop with short grace period
       await queue.stop(100);
 
       // Job should not have completed due to timeout
       expect(jobCompleted).toBe(false);
+
+      if (jobTimer) clearTimeout(jobTimer);
+      releaseJob?.();
+      await waitFor(() => jobCompleted, { describe: 'the abandoned job to settle' });
     });
   });
 });

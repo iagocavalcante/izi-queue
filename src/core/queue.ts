@@ -68,14 +68,23 @@ export class Queue {
     }
 
     if (this.running.size > 0) {
-      const timeout = new Promise<'timeout' | 'done'>((resolve) =>
-        setTimeout(() => resolve('timeout'), gracePeriod)
-      );
+      let graceTimer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<'timeout' | 'done'>((resolve) => {
+        graceTimer = setTimeout(() => resolve('timeout'), gracePeriod);
+      });
 
-      const result = await Promise.race([
-        Promise.all(this.running.values()).then(() => 'done' as const),
-        timeout
-      ]);
+      let result: 'timeout' | 'done';
+      try {
+        result = await Promise.race([
+          Promise.all(this.running.values()).then(() => 'done' as const),
+          timeout
+        ]);
+      } finally {
+        // The jobs usually win the race, and the losing timer would otherwise
+        // keep the event loop alive for the whole grace period -- so a process
+        // that drained in a second still takes 15 to exit.
+        if (graceTimer) clearTimeout(graceTimer);
+      }
 
       if (result === 'timeout' && this.isolatedJobs.size > 0) {
         const terminatePromises = Array.from(this.isolatedJobs).map(jobId =>

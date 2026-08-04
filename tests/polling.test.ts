@@ -1,6 +1,7 @@
 import { Queue } from '../src/core/queue.js';
 import { defineWorker, registerWorker, clearWorkers, WorkerResults } from '../src/core/worker.js';
 import type { DatabaseAdapter, Job } from '../src/types.js';
+import { waitFor } from './helpers/wait.js';
 
 function createJobRow(id: number, overrides: Partial<Job> = {}): Job {
   return {
@@ -146,6 +147,63 @@ describe('queue polling', () => {
     expect(rejections).toHaveLength(0);
     // The queue is still healthy and polling.
     expect(queue.currentState).toBe('stopped');
+  }, 15000);
+
+  it('clears the grace-period timer when jobs finish before it fires', async () => {
+    // stop() races the running jobs against a grace-period timer. When the jobs
+    // win, that timer must still be cleared: otherwise every graceful shutdown
+    // keeps the event loop alive for the full grace period (15s by default),
+    // delaying process exit long after the queue has drained.
+    const GRACE = 15000;
+    const realSetTimeout = global.setTimeout;
+    const realClearTimeout = global.clearTimeout;
+    const graceTimers: unknown[] = [];
+    const cleared = new Set<unknown>();
+
+    (global as unknown as { setTimeout: unknown }).setTimeout = ((
+      fn: () => void,
+      ms?: number,
+      ...rest: unknown[]
+    ) => {
+      const id = (realSetTimeout as unknown as (...a: unknown[]) => unknown)(fn, ms, ...rest);
+      if (ms === GRACE) graceTimers.push(id);
+      return id;
+    }) as unknown as typeof global.setTimeout;
+
+    (global as unknown as { clearTimeout: unknown }).clearTimeout = ((id: unknown) => {
+      cleared.add(id);
+      return (realClearTimeout as unknown as (a: unknown) => unknown)(id);
+    }) as unknown as typeof global.clearTimeout;
+
+    try {
+      registerWorker(
+        defineWorker('blocker', async () => {
+          await new Promise((r) => realSetTimeout(r, 30));
+          return WorkerResults.ok();
+        })
+      );
+
+      let handed = false;
+      const db = {
+        fetchJobs: async () => {
+          if (handed) return [];
+          handed = true;
+          return [createJobRow(1)];
+        },
+        updateJob: async () => null,
+      } as unknown as DatabaseAdapter;
+
+      const queue = new Queue({ name: 'default', limit: 1, pollInterval: 10 }, db, 'node-1');
+      await queue.start();
+      await waitFor(() => queue.runningCount > 0, { describe: 'a job to start' });
+      await queue.stop(GRACE);
+
+      expect(graceTimers).toHaveLength(1);
+      expect(cleared.has(graceTimers[0])).toBe(true);
+    } finally {
+      global.setTimeout = realSetTimeout;
+      global.clearTimeout = realClearTimeout;
+    }
   }, 15000);
 
   it('never runs more jobs concurrently than the queue limit', async () => {

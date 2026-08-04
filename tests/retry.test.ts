@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import { IziQueue } from '../src/core/izi-queue.js';
 import { defineWorker, WorkerResults, clearWorkers } from '../src/core/worker.js';
 import { createSQLiteAdapter, SQLiteAdapter } from '../src/database/sqlite.js';
+import { waitFor } from './helpers/wait.js';
 
 describe('retry lifecycle', () => {
   let db: Database.Database;
@@ -73,9 +74,14 @@ describe('retry lifecycle', () => {
       await queue.start();
 
       const job = await queue.insert('flaky', { args: { x: 1 } });
-      await new Promise((r) => setTimeout(r, 2000));
 
-      const final = await queue.getJob(job.id);
+      const final = await waitFor(
+        async () => {
+          const current = await queue.getJob(job.id);
+          return current?.state === 'completed' ? current : null;
+        },
+        { describe: 'the job to complete after retrying' }
+      );
       await queue.stop();
 
       expect(attempts).toBe(2);
@@ -104,9 +110,14 @@ describe('retry lifecycle', () => {
       await queue.start();
 
       const job = await queue.insert('always_fails', { args: {}, maxAttempts: 3 });
-      await new Promise((r) => setTimeout(r, 2500));
 
-      const final = await queue.getJob(job.id);
+      const final = await waitFor(
+        async () => {
+          const current = await queue.getJob(job.id);
+          return current?.state === 'discarded' ? current : null;
+        },
+        { describe: 'the job to be discarded once attempts run out' }
+      );
       await queue.stop();
 
       expect(attempts).toBe(3);

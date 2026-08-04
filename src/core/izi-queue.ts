@@ -5,7 +5,6 @@ import type {
   Job,
   JobCriteria,
   JobInsertOptions,
-  JobState,
   QueueConfig,
   TelemetryEvent,
   TelemetryHandler,
