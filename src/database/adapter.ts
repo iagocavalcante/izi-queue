@@ -66,7 +66,7 @@ export const SQL = {
     stageJobs: `
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state = 'scheduled' AND scheduled_at <= NOW()
+      WHERE state IN ('scheduled', 'retryable') AND scheduled_at <= NOW()
     `,
     cancelJobs: `
       UPDATE izi_jobs
@@ -149,7 +149,7 @@ export const SQL = {
     stageJobs: `
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state = 'scheduled' AND scheduled_at <= NOW()
+      WHERE state IN ('scheduled', 'retryable') AND scheduled_at <= NOW()
     `,
     cancelJobs: `
       UPDATE izi_jobs
@@ -233,7 +233,7 @@ export const SQL = {
     stageJobs: `
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state = 'scheduled' AND datetime(scheduled_at) <= datetime('now')
+      WHERE state IN ('scheduled', 'retryable') AND datetime(scheduled_at) <= datetime('now')
     `,
     cancelJobs: `
       UPDATE izi_jobs

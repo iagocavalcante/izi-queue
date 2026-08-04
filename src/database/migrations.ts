@@ -67,6 +67,24 @@ export const postgresMigrations: Migration[] = [
       WHERE state = 'executing';
     `,
     down: 'DROP INDEX IF EXISTS izi_jobs_executing_attempted_idx;'
+  },
+  {
+    version: 5,
+    name: 'widen_stager_index_to_retryable',
+    up: `
+      CREATE INDEX IF NOT EXISTS izi_jobs_stageable_idx
+      ON izi_jobs (scheduled_at)
+      WHERE state IN ('scheduled', 'retryable');
+
+      DROP INDEX IF EXISTS izi_jobs_scheduled_at_idx;
+    `,
+    down: `
+      CREATE INDEX IF NOT EXISTS izi_jobs_scheduled_at_idx
+      ON izi_jobs (scheduled_at)
+      WHERE state = 'scheduled';
+
+      DROP INDEX IF EXISTS izi_jobs_stageable_idx;
+    `
   }
 ];
 

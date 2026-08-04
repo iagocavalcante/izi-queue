@@ -181,7 +181,7 @@ export class SQLiteAdapter extends BaseAdapter {
     const stmt = this.db.prepare(`
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state = 'scheduled' AND datetime(scheduled_at) <= datetime('now')
+      WHERE state IN ('scheduled', 'retryable') AND datetime(scheduled_at) <= datetime('now')
     `);
     const result = stmt.run();
     return result.changes;

@@ -397,11 +397,16 @@ describe('SQLiteAdapter', () => {
       // Insert a retryable job that is due to be processed
       db.prepare(`
         INSERT INTO izi_jobs (state, queue, worker, args, scheduled_at)
-        VALUES ('scheduled', 'default', 'RetryableWorker', '{}', datetime('now', '-1 second'))
+        VALUES ('retryable', 'default', 'RetryableWorker', '{}', datetime('now', '-1 second'))
       `).run();
 
       const staged = await adapter.stageJobs();
       expect(staged).toBe(1);
+
+      const job = db
+        .prepare('SELECT state FROM izi_jobs WHERE worker = ?')
+        .get('RetryableWorker') as { state: string };
+      expect(job.state).toBe('available');
     });
   });
 
