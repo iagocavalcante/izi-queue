@@ -1,5 +1,5 @@
 import type { DatabaseAdapter, Job, QueueConfig } from '../types.js';
-import { formatError } from './job.js';
+import { formatError, sourceStatesFor } from './job.js';
 import { executeWorker, getBackoffDelay, hasWorker, getWorker, terminateIsolatedJob } from './worker.js';
 import { telemetry } from './telemetry.js';
 
@@ -192,8 +192,10 @@ export class Queue {
     telemetry.emit('job:start', { job, queue: this.name });
 
     if (!hasWorker(job.worker)) {
-      const error = new Error(`Worker "${job.worker}" not registered`);
-      await this.handleError(job, error, startTime);
+      // Deterministic: no number of retries will make the worker appear on this
+      // node, so retrying only occupies fetch slots for hours before the job is
+      // discarded anyway.
+      await this.handleUnknownWorker(job, startTime);
       return;
     }
 
@@ -237,11 +239,54 @@ export class Queue {
     }
   }
 
-  private async handleSuccess(job: Job, result: unknown, duration: number): Promise<void> {
-    await this.database.updateJob(job.id, {
-      state: 'completed',
-      completedAt: new Date()
+  /**
+   * Applies a terminal or scheduling update, letting the database refuse it if
+   * the job has moved on -- cancelled by an operator, or rescued onto another
+   * node. Returns whether the write landed.
+   */
+  private async transition(
+    job: Job,
+    to: Job['state'],
+    updates: Partial<Job>
+  ): Promise<boolean> {
+    const updated = await this.database.updateJob(
+      job.id,
+      { state: to, ...updates },
+      sourceStatesFor(to)
+    );
+
+    if (!updated) {
+      telemetry.emit('job:transition_refused', {
+        job,
+        queue: this.name,
+        result: { to }
+      });
+      return false;
+    }
+
+    return true;
+  }
+
+  private async handleUnknownWorker(job: Job, startTime: number): Promise<void> {
+    const error = new Error(`Worker "${job.worker}" not registered`);
+    const errors = [...job.errors, formatError(error, job.attempt)];
+
+    await this.transition(job, 'discarded', {
+      errors,
+      discardedAt: new Date()
     });
+
+    telemetry.emit('job:unknown_worker', {
+      job: { ...job, state: 'discarded', errors },
+      queue: this.name,
+      duration: Date.now() - startTime,
+      error
+    });
+  }
+
+  private async handleSuccess(job: Job, result: unknown, duration: number): Promise<void> {
+    const applied = await this.transition(job, 'completed', { completedAt: new Date() });
+    if (!applied) return;
 
     telemetry.emit('job:complete', {
       job: { ...job, state: 'completed' },
@@ -256,11 +301,11 @@ export class Queue {
     const newErrors = [...job.errors, formatError(error, job.attempt)];
 
     if (job.attempt >= job.maxAttempts) {
-      await this.database.updateJob(job.id, {
-        state: 'discarded',
+      const applied = await this.transition(job, 'discarded', {
         errors: newErrors,
         discardedAt: new Date()
       });
+      if (!applied) return;
 
       telemetry.emit('job:error', {
         job: { ...job, state: 'discarded', errors: newErrors },
@@ -272,11 +317,11 @@ export class Queue {
       const backoffMs = getBackoffDelay(job);
       const scheduledAt = new Date(Date.now() + backoffMs);
 
-      await this.database.updateJob(job.id, {
-        state: 'retryable',
+      const applied = await this.transition(job, 'retryable', {
         errors: newErrors,
         scheduledAt
       });
+      if (!applied) return;
 
       telemetry.emit('job:error', {
         job: { ...job, state: 'retryable', errors: newErrors },
@@ -290,11 +335,11 @@ export class Queue {
   private async handleCancel(job: Job, reason: string, duration: number): Promise<void> {
     const newErrors = [...job.errors, formatError(new Error(reason), job.attempt)];
 
-    await this.database.updateJob(job.id, {
-      state: 'cancelled',
+    const applied = await this.transition(job, 'cancelled', {
       errors: newErrors,
       cancelledAt: new Date()
     });
+    if (!applied) return;
 
     telemetry.emit('job:cancel', {
       job: { ...job, state: 'cancelled', errors: newErrors },
@@ -306,11 +351,15 @@ export class Queue {
   private async handleSnooze(job: Job, seconds: number, duration: number): Promise<void> {
     const scheduledAt = new Date(Date.now() + seconds * 1000);
 
-    await this.database.updateJob(job.id, {
-      state: 'scheduled',
+    // The attempt was already consumed by the fetch, but a snooze is not a
+    // failure: without compensating, a job that snoozes while waiting on some
+    // external condition is eventually discarded having never failed once.
+    const applied = await this.transition(job, 'scheduled', {
       scheduledAt,
+      maxAttempts: job.maxAttempts + 1,
       meta: { ...job.meta, snoozedAt: new Date().toISOString() }
     });
+    if (!applied) return;
 
     telemetry.emit('job:snooze', {
       job: { ...job, state: 'scheduled' },

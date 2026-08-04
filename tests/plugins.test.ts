@@ -386,12 +386,16 @@ describe('Plugins', () => {
         await plugin.stop();
       });
 
-      it('should emit job:complete event when pruning jobs', async () => {
+      it('should emit jobs:pruned event when pruning jobs', async () => {
         const events: any[] = [];
-        const unsubscribe = telemetry.on('job:complete', (payload) => {
-          if (payload.queue === 'pruner') {
-            events.push(payload);
-          }
+        // Maintenance gets its own event: counting deleted rows as completed
+        // jobs would corrupt any metric built on job:complete.
+        const unsubscribe = telemetry.on('jobs:pruned', (payload) => {
+          events.push(payload);
+        });
+        const completed: any[] = [];
+        const unsubscribeCompleted = telemetry.on('job:complete', (payload) => {
+          completed.push(payload);
         });
 
         // Insert old completed job
@@ -412,8 +416,10 @@ describe('Plugins', () => {
 
         expect(events.length).toBeGreaterThan(0);
         expect(events[0].result.pruned).toBe(1);
+        expect(completed).toHaveLength(0);
 
         unsubscribe();
+        unsubscribeCompleted();
         await plugin.stop();
       });
     });

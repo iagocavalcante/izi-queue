@@ -16,6 +16,18 @@ export function isValidTransition(from: JobState, to: JobState): boolean {
   return STATE_TRANSITIONS[from].includes(to);
 }
 
+/**
+ * The states a job may legally be in for `to` to be reachable. Passed to
+ * `updateJob` so the database refuses an illegal transition, which is the only
+ * place the check can be made safely: the race is between nodes, not within
+ * this process.
+ */
+export function sourceStatesFor(to: JobState): JobState[] {
+  return (Object.keys(STATE_TRANSITIONS) as JobState[]).filter(from =>
+    STATE_TRANSITIONS[from].includes(to)
+  );
+}
+
 export function isTerminal(state: JobState): boolean {
   return TERMINAL_STATES.includes(state);
 }

@@ -3,6 +3,7 @@ import type {
   IziQueueConfig,
   IsolationConfig,
   Job,
+  JobCriteria,
   JobInsertOptions,
   JobState,
   QueueConfig,
@@ -28,6 +29,27 @@ import { DEFAULT_NODE_TTL } from '../database/adapter.js';
 
 export interface IziQueueFullConfig extends IziQueueConfig {
   plugins?: Plugin[];
+}
+
+/**
+ * Bulk operations must be scoped. An HTTP handler that forwards optional
+ * filters would otherwise act on every job in the database when called with
+ * none of them.
+ */
+function assertScoped(criteria: JobCriteria, operation: string): void {
+  if (criteria.all) return;
+
+  const scoped =
+    (criteria.ids && criteria.ids.length > 0) ||
+    criteria.queue ||
+    criteria.worker ||
+    (criteria.state && criteria.state.length > 0);
+
+  if (!scoped) {
+    throw new Error(
+      `${operation} requires at least one criterion. Pass { all: true } to act on every job.`
+    );
+  }
 }
 
 export interface InsertResult<T = Record<string, unknown>> {
@@ -300,12 +322,39 @@ export class IziQueue {
     return this.config.database.getJob(id);
   }
 
-  async cancelJobs(criteria: {
-    queue?: string;
-    worker?: string;
-    state?: JobState[];
-  }): Promise<number> {
+  async cancelJobs(criteria: JobCriteria): Promise<number> {
+    assertScoped(criteria, 'cancelJobs');
     return this.config.database.cancelJobs(criteria);
+  }
+
+  /** Cancels one job. Returns false if it was already in a terminal state. */
+  async cancelJob(id: number): Promise<boolean> {
+    return (await this.config.database.cancelJobs({ ids: [id] })) > 0;
+  }
+
+  /**
+   * Returns discarded or cancelled jobs to the queue. Jobs that had exhausted
+   * their attempts are given headroom, otherwise they would be discarded again
+   * on the very next fetch.
+   */
+  async retryJobs(criteria: JobCriteria): Promise<number> {
+    assertScoped(criteria, 'retryJobs');
+
+    if (!this.config.database.retryJobs) {
+      throw new Error('The configured database adapter does not support retryJobs');
+    }
+
+    const count = await this.config.database.retryJobs(criteria);
+    if (count > 0) {
+      telemetry.emit('job:retry', { result: { count } });
+      this.queues.forEach(queue => queue.dispatch());
+    }
+    return count;
+  }
+
+  /** Retries one job. Returns false if it was not in a retryable state. */
+  async retryJob(id: number): Promise<boolean> {
+    return (await this.retryJobs({ ids: [id] })) > 0;
   }
 
   async pruneJobs(maxAgeSeconds = 86400 * 7): Promise<number> {

@@ -10,6 +10,47 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ### Fixed
 
+- **Snoozing consumed a retry attempt.** The attempt is claimed at fetch time,
+  and snoozing did not compensate, so a job that snoozed while waiting on an
+  external condition was eventually discarded having never failed once. Snooze
+  now raises `max_attempts` to match, as Oban does. ([#28])
+- **A finishing worker could resurrect a cancelled job.** Result writes went
+  straight to `updateJob` with no check on the job's current state, so a job
+  cancelled while executing was silently marked completed when its worker
+  returned. Transitions are now arbitrated by the database -- the update only
+  lands if the job is still in a state the transition is legal from, and a
+  refusal emits `job:transition_refused`. The state machine was already declared
+  and unit-tested; it was simply never consulted. ([#35])
+- **Jobs with an unregistered worker were retried for hours.** The outcome is
+  deterministic, so they are now discarded immediately with a
+  `job:unknown_worker` event instead of occupying fetch slots through 20
+  backoffs. ([#33])
+- **The pruner reported deleted rows as completed jobs.** It emitted
+  `job:complete` with no job attached, corrupting any metric counting
+  completions. It now emits `jobs:pruned`. ([#39])
+
+### Added
+
+- `cancelJob(id)` and `retryJob(id)`, plus `retryJobs(criteria)`. Retrying a job
+  that had exhausted its attempts raises `max_attempts` so it can actually run
+  rather than being discarded again on its next fetch. ([#30])
+- Bulk operations accept `ids` and require at least one criterion. `cancelJobs({})`
+  previously cancelled every non-terminal job in the database, which a handler
+  forwarding optional filters would do when called with none of them. Acting on
+  everything now requires an explicit `{ all: true }`. ([#30])
+- `updateJob` accepts an optional list of expected source states.
+- Telemetry: `job:retry`, `job:unknown_worker`, `job:transition_refused`,
+  `jobs:pruned`.
+
+### Breaking
+
+- `cancelJobs({})` now throws instead of cancelling every job. Pass
+  `{ all: true }` for the old behaviour.
+- The pruner no longer emits `job:complete`. Anything counting prune runs
+  through that event should move to `jobs:pruned`.
+
+### Fixed
+
 - **Unique job keys could alter the SQL they were looked up with.** `unique.keys`
   entries were interpolated straight into the query in all three adapters. Keys
   are now hashed in JavaScript and never reach a query, so the injection vector
@@ -173,7 +214,12 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#19]: https://github.com/iagocavalcante/izi-queue/issues/19
 [#20]: https://github.com/iagocavalcante/izi-queue/issues/20
 [#25]: https://github.com/iagocavalcante/izi-queue/issues/25
+[#28]: https://github.com/iagocavalcante/izi-queue/issues/28
+[#30]: https://github.com/iagocavalcante/izi-queue/issues/30
+[#33]: https://github.com/iagocavalcante/izi-queue/issues/33
+[#35]: https://github.com/iagocavalcante/izi-queue/issues/35
 [#38]: https://github.com/iagocavalcante/izi-queue/issues/38
+[#39]: https://github.com/iagocavalcante/izi-queue/issues/39
 [#45]: https://github.com/iagocavalcante/izi-queue/issues/45
 [#47]: https://github.com/iagocavalcante/izi-queue/pull/47
 [#50]: https://github.com/iagocavalcante/izi-queue/issues/50

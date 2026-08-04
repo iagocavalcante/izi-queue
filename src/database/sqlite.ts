@@ -1,6 +1,6 @@
 import type { Database } from 'better-sqlite3';
-import type { Job, JobState, UniqueOptions } from '../types.js';
-import { BaseAdapter, DEFAULT_NODE_TTL, rowToJob } from './adapter.js';
+import type { Job, JobCriteria, JobState, UniqueOptions } from '../types.js';
+import { BaseAdapter, DEFAULT_NODE_TTL, criteriaClause, rowToJob } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 import { sqliteMigrations } from './migrations.js';
 
@@ -134,7 +134,15 @@ export class SQLiteAdapter extends BaseAdapter {
     return rows.map(rowToJob);
   }
 
-  async updateJob(id: number, updates: Partial<Job>): Promise<Job | null> {
+  async updateJob(
+    id: number,
+    updates: Partial<Job>,
+    expectedStates?: JobState[]
+  ): Promise<Job | null> {
+    const guard = expectedStates?.length
+      ? ` AND state IN (${expectedStates.map(() => '?').join(',')})`
+      : '';
+
     const stmt = this.db.prepare(`
       UPDATE izi_jobs
       SET state = COALESCE(?, state),
@@ -143,11 +151,13 @@ export class SQLiteAdapter extends BaseAdapter {
           discarded_at = COALESCE(?, discarded_at),
           cancelled_at = COALESCE(?, cancelled_at),
           scheduled_at = COALESCE(?, scheduled_at),
-          meta = COALESCE(?, meta)
-      WHERE id = ?
+          meta = COALESCE(?, meta),
+          attempt = COALESCE(?, attempt),
+          max_attempts = COALESCE(?, max_attempts)
+      WHERE id = ?${guard}
     `);
 
-    stmt.run(
+    const result = stmt.run(
       updates.state ?? null,
       updates.errors ? JSON.stringify(updates.errors) : null,
       updates.completedAt?.toISOString() ?? null,
@@ -155,11 +165,17 @@ export class SQLiteAdapter extends BaseAdapter {
       updates.cancelledAt?.toISOString() ?? null,
       updates.scheduledAt?.toISOString() ?? null,
       updates.meta ? JSON.stringify(updates.meta) : null,
-      id
+      updates.attempt ?? null,
+      updates.maxAttempts ?? null,
+      id,
+      ...(expectedStates ?? [])
     );
 
-    const getStmt = this.db.prepare('SELECT * FROM izi_jobs WHERE id = ?');
-    const row = getStmt.get(id) as Record<string, unknown> | undefined;
+    if (result.changes === 0) return null;
+
+    const row = this.db.prepare('SELECT * FROM izi_jobs WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
     return row ? rowToJob(row) : null;
   }
 
@@ -189,30 +205,31 @@ export class SQLiteAdapter extends BaseAdapter {
     return result.changes;
   }
 
-  async cancelJobs(criteria: { queue?: string; worker?: string; state?: JobState[] }): Promise<number> {
-    let sql = `
+  async cancelJobs(criteria: JobCriteria): Promise<number> {
+    const { clause, params } = criteriaClause(criteria, () => '?');
+    const stmt = this.db.prepare(`
       UPDATE izi_jobs
       SET state = 'cancelled', cancelled_at = datetime('now')
-      WHERE state NOT IN ('completed', 'discarded', 'cancelled')
-    `;
-    const params: unknown[] = [];
+      WHERE state NOT IN ('completed', 'discarded', 'cancelled')${clause}
+    `);
+    return stmt.run(...params).changes;
+  }
 
-    if (criteria.queue) {
-      sql += ' AND queue = ?';
-      params.push(criteria.queue);
-    }
-    if (criteria.worker) {
-      sql += ' AND worker = ?';
-      params.push(criteria.worker);
-    }
-    if (criteria.state && criteria.state.length > 0) {
-      sql += ` AND state IN (${criteria.state.map(() => '?').join(',')})`;
-      params.push(...criteria.state);
-    }
-
-    const stmt = this.db.prepare(sql);
-    const result = stmt.run(...params);
-    return result.changes;
+  async retryJobs(criteria: JobCriteria): Promise<number> {
+    const { clause, params } = criteriaClause(criteria, () => '?');
+    // Raising max_attempts matters for jobs that were discarded after
+    // exhausting them: without headroom the job would be discarded again on
+    // its very next fetch.
+    const stmt = this.db.prepare(`
+      UPDATE izi_jobs
+      SET state = 'available',
+          scheduled_at = datetime('now'),
+          discarded_at = NULL,
+          cancelled_at = NULL,
+          max_attempts = CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END
+      WHERE state IN ('discarded', 'cancelled')${clause}
+    `);
+    return stmt.run(...params).changes;
   }
 
   async rescueStuckJobs(rescueAfter: number, nodeTtl = DEFAULT_NODE_TTL): Promise<number> {

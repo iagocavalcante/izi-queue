@@ -45,6 +45,18 @@ export interface UniqueOptions {
   states?: JobState[];
 }
 
+export interface JobCriteria {
+  ids?: number[];
+  queue?: string;
+  worker?: string;
+  state?: JobState[];
+  /**
+   * Required to act on every job. Without it an empty criteria object is
+   * rejected, so a handler forwarding optional filters cannot wipe the queue.
+   */
+  all?: boolean;
+}
+
 export interface JobInsertOptions<T = Record<string, unknown>> {
   args: T;
   queue?: string;
@@ -146,11 +158,19 @@ export interface DatabaseAdapter {
    * abandoned by a dead node from one still running on a live node.
    */
   fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]>;
-  updateJob(id: number, updates: Partial<Job>): Promise<Job | null>;
+  /**
+   * Applies `updates` to a job. When `expectedStates` is given the database
+   * arbitrates the transition: the write only lands if the job is still in one
+   * of those states, and `null` is returned otherwise. That check has to happen
+   * in the database, because the race is between nodes.
+   */
+  updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[]): Promise<Job | null>;
   getJob(id: number): Promise<Job | null>;
   pruneJobs(maxAge: number): Promise<number>;
   stageJobs(): Promise<number>;
-  cancelJobs(criteria: { queue?: string; worker?: string; state?: JobState[] }): Promise<number>;
+  cancelJobs(criteria: JobCriteria): Promise<number>;
+  /** Returns discarded or cancelled jobs to the queue. */
+  retryJobs?(criteria: JobCriteria): Promise<number>;
   /**
    * Returns jobs abandoned by dead nodes to the queue (or discards them when
    * their attempts are exhausted). `nodeTtl` is how many seconds a node may go
@@ -210,6 +230,10 @@ export type TelemetryEvent =
   | 'job:cancel'
   | 'job:snooze'
   | 'job:rescue'
+  | 'job:retry'
+  | 'job:unknown_worker'
+  | 'job:transition_refused'
+  | 'jobs:pruned'
   | 'job:unique_conflict'
   | 'job:isolated:start'
   | 'job:isolated:timeout'
