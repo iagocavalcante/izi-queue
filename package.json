@@ -23,7 +23,8 @@
     "test:coverage": "jest --coverage",
     "lint": "eslint src --ext .ts",
     "benchmark": "npx tsx benchmarks/benchmark.ts",
-    "prepublishOnly": "npm run build && npm test"
+    "prepublishOnly": "npm run build && npm test",
+    "pretest": "npm run build"
   },
   "keywords": [
     "job-queue",

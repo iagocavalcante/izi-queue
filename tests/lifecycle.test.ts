@@ -4,6 +4,7 @@ import { defineWorker, WorkerResults, clearWorkers } from '../src/core/worker.js
 import { createSQLiteAdapter, SQLiteAdapter } from '../src/database/sqlite.js';
 import { telemetry } from '../src/core/telemetry.js';
 import type { Job, TelemetryEvent } from '../src/types.js';
+import { waitFor, waitForEvent } from './helpers/wait.js';
 
 describe('job lifecycle', () => {
   let db: Database.Database;
@@ -52,8 +53,14 @@ describe('job lifecycle', () => {
 
       await queue.start();
       const job = await queue.insert('snoozer', { args: {}, maxAttempts: 2 });
-      await new Promise((r) => setTimeout(r, 1500));
-      const final = await queue.getJob(job.id);
+
+      const final = await waitFor(
+        async () => {
+          const current = await queue.getJob(job.id);
+          return current?.state === 'completed' ? current : null;
+        },
+        { describe: 'the job to complete after snoozing three times' }
+      );
       await queue.stop();
 
       // Snoozing three times with maxAttempts: 2 must not exhaust the job.
@@ -68,8 +75,14 @@ describe('job lifecycle', () => {
 
       await queue.start();
       const job = await queue.insert('snooze_once', { args: {}, maxAttempts: 5 });
-      await new Promise((r) => setTimeout(r, 400));
-      const snoozed = await queue.getJob(job.id);
+
+      const snoozed = await waitFor(
+        async () => {
+          const current = await queue.getJob(job.id);
+          return current?.state === 'scheduled' ? current : null;
+        },
+        { describe: 'the job to be snoozed' }
+      );
       await queue.stop();
 
       expect(snoozed?.state).toBe('scheduled');
@@ -86,8 +99,14 @@ describe('job lifecycle', () => {
 
       await queue.start();
       const job = await queue.insert('NeverRegistered', { args: {} });
-      await new Promise((r) => setTimeout(r, 400));
-      const final = await queue.getJob(job.id);
+
+      const final = await waitFor(
+        async () => {
+          const current = await queue.getJob(job.id);
+          return current?.state === 'discarded' ? current : null;
+        },
+        { describe: 'the job to be discarded for having no worker' }
+      );
       await queue.stop();
 
       expect(final?.state).toBe('discarded');
@@ -113,14 +132,20 @@ describe('job lifecycle', () => {
 
       await queue.start();
       const job = await queue.insert('slow', { args: {} });
-      await new Promise((r) => setTimeout(r, 300)); // let it start executing
 
-      expect((await queue.getJob(job.id))?.state).toBe('executing');
+      await waitFor(
+        async () => (await queue.getJob(job.id))?.state === 'executing',
+        { describe: 'the job to start executing' }
+      );
       await queue.cancelJobs({ queue: 'default' });
       expect((await queue.getJob(job.id))?.state).toBe('cancelled');
 
+      // The worker now succeeds, and the write it attempts must be refused.
+      // Waiting on that event is exact; sleeping would only be a guess.
+      const refused = waitForEvent('job:transition_refused');
       release!();
-      await new Promise((r) => setTimeout(r, 300));
+      await refused;
+
       const final = await queue.getJob(job.id);
       await queue.stop();
 
@@ -218,7 +243,6 @@ describe('job lifecycle', () => {
 
       const pruner = new PrunerPlugin({ interval: 60000, maxAge: 3600 });
       await pruner.start({ database: adapter, node: 'node-1', queues: ['default'] });
-      await new Promise((r) => setTimeout(r, 50));
       await (pruner as unknown as { prune(): Promise<void> }).prune();
       await pruner.stop();
 

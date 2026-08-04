@@ -25,6 +25,5 @@ module.exports = {
   coverageDirectory: 'coverage',
   coverageReporters: ['text', 'lcov'],
   testTimeout: 10000,
-  forceExit: true,
   silent: true, // Suppress migration logs during tests
 };

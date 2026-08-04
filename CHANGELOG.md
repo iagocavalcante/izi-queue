@@ -10,6 +10,38 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ### Fixed
 
+- **`stop()` left its grace-period timer pending.** The shutdown races running
+  jobs against a timer, and when the jobs won -- the normal case -- the timer
+  was never cleared. A process that drained in a second still kept the event
+  loop alive for the full grace period, 15 seconds by default, before it could
+  exit. Found while removing `forceExit` from the test runner.
+
+### Added
+
+- **Continuous integration.** Build, lint and typecheck, plus the full suite on
+  Node 18, 20, 22 and 24 against real PostgreSQL and MySQL service containers,
+  a matrix over the supported `better-sqlite3` majors, and a job that packs the
+  tarball and installs it into a clean project. Nothing enforced any of this
+  before, which is how retries stayed broken across two releases, how MySQL
+  shipped untested, and how the peer range drifted out of date. ([#42])
+- `pretest` builds before running the suite, so `npm test` works on a clean
+  checkout. The isolation tests load the compiled worker thread and previously
+  failed with 16 opaque errors until someone thought to build first. ([#42])
+
+### Changed
+
+- **Tests wait on conditions instead of sleeping.** Fixed-duration sleeps were
+  betting that work finished inside a guessed window, which fails intermittently
+  on a loaded machine and makes every run pay the full duration regardless. The
+  retry and lifecycle suites went from about nine seconds to 1.6, and no longer
+  depend on wall-clock timing. ([#41])
+- `forceExit` is gone from the Jest config, so a leaked handle now fails loudly
+  instead of being papered over. Two were found and fixed in the process: the
+  grace-period timer above, and a test that abandoned a running job without
+  releasing it. ([#41])
+
+### Fixed
+
 - **Snoozing consumed a retry attempt.** The attempt is claimed at fetch time,
   and snoozing did not compensate, so a job that snoozed while waiting on an
   external condition was eventually discarded having never failed once. Snooze
@@ -215,6 +247,8 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#20]: https://github.com/iagocavalcante/izi-queue/issues/20
 [#25]: https://github.com/iagocavalcante/izi-queue/issues/25
 [#28]: https://github.com/iagocavalcante/izi-queue/issues/28
+[#41]: https://github.com/iagocavalcante/izi-queue/issues/41
+[#42]: https://github.com/iagocavalcante/izi-queue/issues/42
 [#30]: https://github.com/iagocavalcante/izi-queue/issues/30
 [#33]: https://github.com/iagocavalcante/izi-queue/issues/33
 [#35]: https://github.com/iagocavalcante/izi-queue/issues/35
