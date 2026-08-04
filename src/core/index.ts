@@ -32,3 +32,4 @@ export {
   initializeIsolation,
   shutdownIsolation
 } from './isolation/index.js';
+export { computeUniqueKey, advisoryLockKey } from './unique.js';

@@ -21,6 +21,8 @@ export {
   defineWorker,
   WorkerResults,
   telemetry,
+  computeUniqueKey,
+  advisoryLockKey,
   initializeIsolatedWorkers,
   shutdownIsolatedWorkers,
   terminateIsolatedJob,

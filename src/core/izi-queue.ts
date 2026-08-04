@@ -12,6 +12,7 @@ import type {
 } from '../types.js';
 import type { Plugin, PluginContext } from '../plugins/plugin.js';
 import { createJob } from './job.js';
+import { computeUniqueKey } from './unique.js';
 import { Queue } from './queue.js';
 import { telemetry } from './telemetry.js';
 import {
@@ -240,19 +241,26 @@ export class IziQueue {
       priority: options.priority ?? workerDef?.priority ?? 0
     });
 
-    if (options.unique && this.config.database.checkUnique) {
-      const existingJob = await this.config.database.checkUnique(
-        options.unique,
-        jobData as Omit<Job, 'id' | 'insertedAt'>
-      );
+    if (options.unique) {
+      const data = {
+        ...jobData,
+        uniqueKey: computeUniqueKey(jobData, options.unique)
+      } as Omit<Job, 'id' | 'insertedAt'>;
 
-      if (existingJob) {
+      const result = this.config.database.insertUnique
+        ? await this.config.database.insertUnique(data, options.unique)
+        : await this.insertUniqueUnsafely(data, options.unique);
+
+      if (result.conflict) {
         telemetry.emit('job:unique_conflict', {
-          job: existingJob,
-          queue: existingJob.queue
+          job: result.job,
+          queue: result.job.queue
         });
-        return { job: existingJob as Job<T>, conflict: true };
+      } else if (this.started && this.config.database.notify) {
+        await this.config.database.notify(result.job.queue);
       }
+
+      return { job: result.job as Job<T>, conflict: result.conflict };
     }
 
     const job = await this.config.database.insertJob(jobData as Omit<Job, 'id' | 'insertedAt'>);
@@ -262,6 +270,23 @@ export class IziQueue {
     }
 
     return { job: job as Job<T>, conflict: false };
+  }
+
+  /**
+   * Fallback for adapters predating `insertUnique`. The check and the insert are
+   * separate statements, so two callers racing on the same unique job can both
+   * observe "no conflict" and both insert.
+   */
+  private async insertUniqueUnsafely(
+    data: Omit<Job, 'id' | 'insertedAt'>,
+    unique: NonNullable<JobInsertOptions['unique']>
+  ): Promise<{ job: Job; conflict: boolean }> {
+    if (this.config.database.checkUnique) {
+      const existing = await this.config.database.checkUnique(unique, data);
+      if (existing) return { job: existing, conflict: true };
+    }
+
+    return { job: await this.config.database.insertJob(data), conflict: false };
   }
 
   async insertAll<T = Record<string, unknown>>(

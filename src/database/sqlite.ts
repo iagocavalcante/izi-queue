@@ -1,6 +1,7 @@
 import type { Database } from 'better-sqlite3';
 import type { Job, JobState, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_NODE_TTL, rowToJob } from './adapter.js';
+import { computeUniqueKey } from '../core/unique.js';
 import { sqliteMigrations } from './migrations.js';
 
 export class SQLiteAdapter extends BaseAdapter {
@@ -24,11 +25,8 @@ export class SQLiteAdapter extends BaseAdapter {
     const appliedVersions = new Set((stmt.all() as { version: number }[]).map(r => r.version));
 
     const applyMigration = this.db.transaction((migration: typeof sqliteMigrations[0]) => {
-      const statements = migration.up.split(';').filter(s => s.trim());
-      for (const sql of statements) {
-        if (sql.trim()) {
-          this.db.exec(sql);
-        }
+      for (const statement of migration.up) {
+        this.db.exec(statement);
       }
 
       this.db.prepare('INSERT INTO izi_migrations (version, name) VALUES (?, ?)').run(
@@ -53,7 +51,9 @@ export class SQLiteAdapter extends BaseAdapter {
       const migration = sqliteMigrations.find(m => m.version === version);
       if (migration?.down) {
         console.log(`[izi-queue] Rolling back migration ${migration.version}: ${migration.name}`);
-        this.db.exec(migration.down);
+        for (const statement of migration.down) {
+          this.db.exec(statement);
+        }
         this.db.prepare('DELETE FROM izi_migrations WHERE version = ?').run(version);
       }
     });
@@ -76,8 +76,8 @@ export class SQLiteAdapter extends BaseAdapter {
 
   async insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job> {
     const stmt = this.db.prepare(`
-      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at, unique_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const result = stmt.run(
@@ -91,7 +91,8 @@ export class SQLiteAdapter extends BaseAdapter {
       job.attempt,
       job.maxAttempts,
       job.priority,
-      job.scheduledAt.toISOString()
+      job.scheduledAt.toISOString(),
+      job.uniqueKey ?? null
     );
 
     const getStmt = this.db.prepare('SELECT * FROM izi_jobs WHERE id = ?');
@@ -255,46 +256,72 @@ export class SQLiteAdapter extends BaseAdapter {
     this.db.prepare('DELETE FROM izi_nodes WHERE name = ?').run(node);
   }
 
-  async checkUnique(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null> {
-    const fields = options.fields ?? ['worker', 'queue', 'args'];
-    const states = options.states ?? ['available', 'scheduled', 'executing', 'retryable'];
-    const period = options.period === 'infinity' ? 999999999 : (options.period ?? 60);
+  private findUnique(uniqueKey: string, states: string[], period: number | null): Job | null {
+    const placeholders = states.map(() => '?').join(',');
+    const sql = `
+      SELECT * FROM izi_jobs
+      WHERE unique_key = ?
+        AND state IN (${placeholders})
+        ${period !== null ? `AND datetime(inserted_at) > datetime('now', '-' || ? || ' seconds')` : ''}
+      ORDER BY id ASC
+      LIMIT 1
+    `;
+    const params: unknown[] = [uniqueKey, ...states];
+    if (period !== null) params.push(period);
 
-    let sql = `SELECT * FROM izi_jobs WHERE state IN (${states.map(() => '?').join(',')})`;
-    const params: unknown[] = [...states];
-
-    if (period !== 999999999) {
-      sql += ` AND datetime(inserted_at) > datetime('now', '-' || ? || ' seconds')`;
-      params.push(period);
-    }
-
-    if (fields.includes('worker')) {
-      sql += ' AND worker = ?';
-      params.push(job.worker);
-    }
-
-    if (fields.includes('queue')) {
-      sql += ' AND queue = ?';
-      params.push(job.queue);
-    }
-
-    if (fields.includes('args')) {
-      if (options.keys && options.keys.length > 0) {
-        for (const key of options.keys) {
-          sql += ` AND json_extract(args, '$.${key}') = ?`;
-          params.push((job.args as Record<string, unknown>)[key] ?? null);
-        }
-      } else {
-        sql += ' AND args = ?';
-        params.push(JSON.stringify(job.args));
-      }
-    }
-
-    sql += ' LIMIT 1';
-
-    const stmt = this.db.prepare(sql);
-    const row = stmt.get(...params) as Record<string, unknown> | undefined;
+    const row = this.db.prepare(sql).get(...params) as Record<string, unknown> | undefined;
     return row ? rowToJob(row) : null;
+  }
+
+  async checkUnique(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null> {
+    const { states, period } = this.uniqueLookup(options);
+    return this.findUnique(job.uniqueKey ?? computeUniqueKey(job, options), states, period);
+  }
+
+  async insertUnique(
+    job: Omit<Job, 'id' | 'insertedAt'>,
+    options: UniqueOptions
+  ): Promise<{ job: Job; conflict: boolean }> {
+    const { states, period } = this.uniqueLookup(options);
+    const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
+
+    // `immediate` takes the write lock up front. A deferred transaction would
+    // start as a reader and only try to upgrade at the INSERT, which SQLite
+    // refuses outright rather than waiting when another writer got there first.
+    const run = this.db.transaction(() => {
+      const existing = this.findUnique(uniqueKey, states, period);
+      if (existing) return { job: existing, conflict: true };
+      return { job: this.insertJobSync({ ...job, uniqueKey }), conflict: false };
+    });
+
+    return run.immediate();
+  }
+
+  private insertJobSync(job: Omit<Job, 'id' | 'insertedAt'>): Job {
+    const result = this.db
+      .prepare(`
+        INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at, unique_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        job.state,
+        job.queue,
+        job.worker,
+        JSON.stringify(job.args),
+        JSON.stringify(job.meta),
+        JSON.stringify(job.tags),
+        JSON.stringify(job.errors),
+        job.attempt,
+        job.maxAttempts,
+        job.priority,
+        job.scheduledAt.toISOString(),
+        job.uniqueKey ?? null
+      );
+
+    const row = this.db
+      .prepare('SELECT * FROM izi_jobs WHERE id = ?')
+      .get(result.lastInsertRowid) as Record<string, unknown>;
+    return rowToJob(row);
   }
 
   async close(): Promise<void> {

@@ -1,4 +1,5 @@
 import type { DatabaseAdapter, Job, JobState } from '../types.js';
+import { DEFAULT_UNIQUE_PERIOD, DEFAULT_UNIQUE_STATES } from '../core/unique.js';
 
 /**
  * Seconds a node may go without a heartbeat before it is presumed dead and its
@@ -36,8 +37,8 @@ export const SQL = {
       'CREATE INDEX IF NOT EXISTS izi_jobs_state_idx ON izi_jobs (state)'
     ],
     insertJob: `
-      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at, unique_key)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
       RETURNING *
     `,
     fetchJobs: `
@@ -139,8 +140,8 @@ export const SQL = {
       )
     `,
     insertJob: `
-      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at, unique_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     fetchJobs: `
       SELECT * FROM izi_jobs
@@ -238,8 +239,8 @@ export const SQL = {
       'CREATE INDEX IF NOT EXISTS izi_jobs_state_idx ON izi_jobs (state)'
     ],
     insertJob: `
-      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at, unique_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     fetchJobs: `
       UPDATE izi_jobs
@@ -345,6 +346,7 @@ export function rowToJob(row: Record<string, unknown>): Job {
     scheduledAt: parseDate(row.scheduled_at) as Date,
     attemptedAt: parseDate(row.attempted_at),
     attemptedBy: (row.attempted_by as string | null) ?? null,
+    uniqueKey: (row.unique_key as string | null) ?? null,
     completedAt: parseDate(row.completed_at),
     discardedAt: parseDate(row.discarded_at),
     cancelledAt: parseDate(row.cancelled_at)
@@ -361,5 +363,15 @@ export abstract class BaseAdapter implements DatabaseAdapter {
   abstract stageJobs(): Promise<number>;
   abstract cancelJobs(criteria: { queue?: string; worker?: string; state?: JobState[] }): Promise<number>;
   abstract rescueStuckJobs(rescueAfter: number, nodeTtl?: number): Promise<number>;
+
+  /** Shared predicate for locating an existing unique job. */
+  protected uniqueLookup(options: import('../types.js').UniqueOptions): {
+    states: string[];
+    period: number | null;
+  } {
+    const states = options.states ?? DEFAULT_UNIQUE_STATES;
+    const period = options.period === 'infinity' ? null : (options.period ?? DEFAULT_UNIQUE_PERIOD);
+    return { states, period };
+  }
   abstract close(): Promise<void>;
 }
