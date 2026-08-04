@@ -71,6 +71,15 @@ describePostgres('PostgresAdapter', () => {
     expect(jobs[0].attemptedBy).toBe('node-a');
   });
 
+  it('orders claimed jobs by priority', async () => {
+    await adapter.insertJob(jobData({ priority: 5, args: { order: 'last' } }));
+    await adapter.insertJob(jobData({ priority: -5, args: { order: 'first' } }));
+
+    const jobs = await adapter.fetchJobs('default', 2, 'node-a');
+
+    expect((jobs[0].args as { order: string }).order).toBe('first');
+  });
+
   it('stages both scheduled and retryable jobs once due', async () => {
     await pool.query(
       `INSERT INTO izi_jobs (state, queue, worker, args, scheduled_at)

@@ -158,9 +158,12 @@ export class MySQLAdapter extends BaseAdapter {
 
       await connection.commit();
 
-      // Fetch the updated jobs
+      // Fetch the updated jobs. The ORDER BY matters: without it the rows come
+      // back in whatever order the server chooses, so a high-priority job could
+      // be handed to the executor after a low-priority one from the same batch.
       const [updatedRows] = await connection.query<RowDataPacket[]>(
-        `SELECT * FROM izi_jobs WHERE id IN (?)`,
+        `SELECT * FROM izi_jobs WHERE id IN (?)
+         ORDER BY priority ASC, scheduled_at ASC, id ASC`,
         [ids]
       );
 

@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below 1.0.0, breaking changes are released as minor versions.
 
+## [0.4.1] - 2026-08-04
+
+### Fixed
+
+- **`npm install izi-queue better-sqlite3` failed.** The `better-sqlite3` peer
+  range was `^9.0.0` while the library is developed and tested against v12, so
+  npm either resolved a version with no prebuilt binary for current Node (which
+  fails to compile) or refused the install with `ERESOLVE`. The range is now
+  `>=9.0.0 <14.0.0`. Verified against 11.10.0, 12.11.1 and 13.0.2; v9 and v10
+  cannot be built on Node 24 to test, but remain within the declared range so
+  that existing installs on older Node are not broken. ([#50])
+- **Claimed jobs were handed to the executor in arbitrary order** on PostgreSQL
+  and MySQL, so a high-priority job could start after a low-priority one from
+  the same batch. Priority still governed which jobs were claimed, but not the
+  order they ran. PostgreSQL `RETURNING` follows physical update order rather
+  than the subquery's `ORDER BY`, and the MySQL adapter's post-claim `SELECT`
+  had no `ORDER BY` at all. Both now order by priority, schedule and id, which
+  is what SQLite already did. Found by the new MySQL coverage below.
+- Worker execution timeout timers are now cleared when a job settles, instead
+  of being retained for the full timeout. Thanks to @gentosai404. ([#38], [#47])
+
+### Added
+
+- Test coverage for the MySQL adapter against a real server, enabled by setting
+  `IZI_TEST_MYSQL_URL`. MySQL previously had no automated tests at all despite
+  being listed as production ready.
+
 ## [0.4.0] - 2026-08-04
 
 Three defects in this release could each cause data loss or an outage in
@@ -84,4 +111,8 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#15]: https://github.com/iagocavalcante/izi-queue/issues/15
 [#16]: https://github.com/iagocavalcante/izi-queue/issues/16
 [#17]: https://github.com/iagocavalcante/izi-queue/issues/17
+[#38]: https://github.com/iagocavalcante/izi-queue/issues/38
+[#47]: https://github.com/iagocavalcante/izi-queue/pull/47
+[#50]: https://github.com/iagocavalcante/izi-queue/issues/50
 [0.4.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.3.0...v0.4.0
+[0.4.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.0...v0.4.1

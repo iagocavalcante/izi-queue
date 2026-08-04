@@ -230,6 +230,10 @@ async perform(job) {
 
 **PostgreSQL** is recommended for production due to `FOR UPDATE SKIP LOCKED` support for efficient concurrent job fetching.
 
+**MySQL requires 8.0.1 or later** for `FOR UPDATE SKIP LOCKED`. MariaDB does not implement it and is not supported.
+
+Driver versions covered by the test suite: `better-sqlite3` 11-13, `pg` 8, `mysql2` 3.
+
 ## Examples
 
 Check out the [examples](./examples) directory:
