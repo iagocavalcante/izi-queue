@@ -30,6 +30,22 @@ export async function perform(job) {
       };
     }
 
+    case 'allocate': {
+      // Used to prove resourceLimits are actually applied: with a small heap
+      // cap this must kill the thread rather than succeed.
+      // Arrays of numbers, not Buffers: maxOldGenerationSizeMb governs the V8
+      // heap, and Buffer memory is external to it, so buffers would sail past
+      // any cap. Each 1M-element array is roughly 8MB of old-generation heap.
+      const chunks = [];
+      const target = job.args.megabytes || 64;
+      for (let i = 0; i < Math.ceil(target / 8); i++) {
+        const chunk = new Array(1000000).fill(i);
+        chunk[0] = i; // touch it so it cannot be optimised away
+        chunks.push(chunk);
+      }
+      return { status: 'ok', value: { allocated: chunks.length } };
+    }
+
     case 'crash':
       throw new Error(crashMessage || 'Intentional crash');
 

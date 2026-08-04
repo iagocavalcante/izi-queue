@@ -191,6 +191,10 @@ const isolatedWorker = defineWorker('heavy_computation', async (job) => {
   isolation: {
     isolated: true,
     workerPath: './workers/heavy-computation.js',
+    resourceLimits: {
+      maxOldGenerationSizeMb: 128,   // caps the worker's V8 heap
+      maxYoungGenerationSizeMb: 32,
+    },
   },
   timeout: 30000, // 30 seconds
 });
@@ -206,14 +210,16 @@ const queue = new IziQueue({
 });
 ```
 
-> **Keep a queue's concurrency at or below `maxThreads`.** A job that finds the
-> pool saturated currently fails with `No available worker threads` and consumes
-> a retry attempt rather than waiting. Tracked in
-> [#22](https://github.com/iagocavalcante/izi-queue/issues/22).
->
-> `resourceLimits` is accepted by the type but **not currently applied** to
-> worker threads, so isolated workers run without a memory cap. Tracked in
-> [#23](https://github.com/iagocavalcante/izi-queue/issues/23).
+A job that arrives while every thread is busy waits for one rather than
+failing, so a queue's concurrency may exceed `maxThreads` without jobs burning
+retry attempts on the pool being full. The job's `timeout` covers that wait as
+well as its execution, so a saturated pool cannot leave work outstanding
+indefinitely.
+
+`resourceLimits` are applied when the thread is created, and threads are pooled
+per limit set — jobs asking for different limits do not share a thread. Note
+that `maxOldGenerationSizeMb` caps the V8 heap; `Buffer` memory lives outside it
+and is not governed by that setting.
 
 ### Plugins
 

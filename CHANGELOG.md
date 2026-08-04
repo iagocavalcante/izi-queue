@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below 1.0.0, breaking changes are released as minor versions.
 
+## [Unreleased]
+
+### Fixed
+
+- **Isolated jobs failed when the thread pool was full.** A job arriving while
+  every thread was busy came back with `No available worker threads`, which the
+  queue recorded as a failure and charged one of the job's retry attempts --
+  for something the job had no part in. Any queue whose concurrency exceeded
+  `maxThreads` hit this routinely. Jobs now wait for a thread. The job's
+  `timeout` covers the wait as well as the execution, so a saturated pool
+  cannot leave work outstanding indefinitely, and giving up while queued
+  reports a distinct error rather than looking like an execution failure.
+  ([#22])
+- **`resourceLimits` were never applied.** They were typed, documented and
+  passed in, but the pool created every thread with no limits, so isolated
+  workers ran without the memory cap that is the main reason to isolate them at
+  all. Limits are now applied when the thread is created, and the pool is
+  partitioned by them so a job never lands on a thread with the wrong caps.
+  ([#23])
+- **The PostgreSQL notification listener never recovered from a dropped
+  connection.** After a failover, an idle-connection reaper or a network blip,
+  the listener stopped receiving notifications permanently and the queue
+  degraded to poll-only with nothing to indicate it. The listener now
+  re-subscribes with backoff, and reports the disconnect through telemetry.
+  Verified by terminating its backend mid-test and asserting notifications
+  resume. ([#24])
+
 ## [0.6.0] - 2026-08-04
 
 ### Fixed
@@ -278,6 +305,9 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#20]: https://github.com/iagocavalcante/izi-queue/issues/20
 [#25]: https://github.com/iagocavalcante/izi-queue/issues/25
 [#21]: https://github.com/iagocavalcante/izi-queue/issues/21
+[#22]: https://github.com/iagocavalcante/izi-queue/issues/22
+[#23]: https://github.com/iagocavalcante/izi-queue/issues/23
+[#24]: https://github.com/iagocavalcante/izi-queue/issues/24
 [#28]: https://github.com/iagocavalcante/izi-queue/issues/28
 [#41]: https://github.com/iagocavalcante/izi-queue/issues/41
 [#42]: https://github.com/iagocavalcante/izi-queue/issues/42

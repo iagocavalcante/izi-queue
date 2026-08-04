@@ -4,6 +4,7 @@ import { join } from 'path';
 import { isolationDir } from './worker-path.js';
 import type {
   IsolatedWorkerOptions,
+  ResourceLimits,
   SerializableJob,
   WorkerResult,
   WorkerThreadMessage
@@ -31,6 +32,29 @@ interface PooledWorker {
   busy: boolean;
   lastUsed: number;
   currentJobId: number | null;
+  /**
+   * Resource limits are fixed when a thread is created, so a worker can only
+   * serve jobs asking for the same ones. This key partitions the pool.
+   */
+  limitsKey: string;
+  limits?: ResourceLimits;
+}
+
+interface Waiter {
+  limitsKey: string;
+  limits?: ResourceLimits;
+  resolve: (worker: PooledWorker | null) => void;
+}
+
+/** Stable identity for a set of resource limits, used to match threads to jobs. */
+function limitsKeyFor(limits?: ResourceLimits): string {
+  if (!limits) return '';
+  return JSON.stringify({
+    maxOldGenerationSizeMb: limits.maxOldGenerationSizeMb ?? null,
+    maxYoungGenerationSizeMb: limits.maxYoungGenerationSizeMb ?? null,
+    codeRangeSizeMb: limits.codeRangeSizeMb ?? null,
+    stackSizeMb: limits.stackSizeMb ?? null
+  });
 }
 
 export interface ThreadPoolConfig {
@@ -54,6 +78,7 @@ export class ThreadPool {
     timeoutId: ReturnType<typeof setTimeout>;
   }> = new Map();
   private cleanupInterval?: ReturnType<typeof setInterval>;
+  private waiters: Waiter[] = [];
   private shuttingDown = false;
 
   constructor(config: ThreadPoolConfig = {}) {
@@ -87,11 +112,13 @@ export class ThreadPool {
     });
   }
 
-  private createWorker(): PooledWorker {
+  private createWorker(limits?: ResourceLimits): PooledWorker {
     if (!WORKER_THREAD_PATH) {
       WORKER_THREAD_PATH = getWorkerThreadPath();
     }
-    const worker = new Worker(WORKER_THREAD_PATH);
+    // Limits have to be supplied at construction: a thread's heap cannot be
+    // capped after it starts. That is why the pool is partitioned by them.
+    const worker = new Worker(WORKER_THREAD_PATH, limits ? { resourceLimits: limits } : undefined);
 
     telemetry.emit('thread:spawn', {
       threadId: worker.threadId
@@ -101,7 +128,9 @@ export class ThreadPool {
       worker,
       busy: false,
       lastUsed: Date.now(),
-      currentJobId: null
+      currentJobId: null,
+      limitsKey: limitsKeyFor(limits),
+      limits
     };
 
     worker.on('message', (message: WorkerThreadMessage) => {
@@ -135,6 +164,8 @@ export class ThreadPool {
         } else {
           pending.resolve({ status: 'ok' });
         }
+
+        this.handOffToWaiter();
       }
     } else if (message.type === 'error' && message.jobId !== undefined) {
       const pending = this.pendingJobs.get(message.jobId);
@@ -149,6 +180,8 @@ export class ThreadPool {
           status: 'error',
           error: new Error(message.error || 'Unknown worker error')
         });
+
+        this.handOffToWaiter();
       }
     }
   }
@@ -166,10 +199,9 @@ export class ThreadPool {
       }
     }
 
-    const index = this.workers.indexOf(pooled);
-    if (index !== -1) {
-      this.workers.splice(index, 1);
-    }
+    this.removeWorker(pooled);
+    // Its slot is free even though it died, so someone queued can start.
+    this.handOffToWaiter();
 
     telemetry.emit('thread:exit', {
       threadId: pooled.worker.threadId,
@@ -190,28 +222,100 @@ export class ThreadPool {
       }
     }
 
-    const index = this.workers.indexOf(pooled);
-    if (index !== -1) {
-      this.workers.splice(index, 1);
-    }
+    this.removeWorker(pooled);
+    // Its slot is free even though it died, so someone queued can start.
+    this.handOffToWaiter();
 
     telemetry.emit('thread:exit', {
       threadId: pooled.worker.threadId
     });
   }
 
-  private getAvailableWorker(): PooledWorker | null {
-    for (const pooled of this.workers) {
-      if (!pooled.busy) {
-        return pooled;
-      }
+  /**
+   * Finds or creates a thread able to run a job with these limits, waiting if
+   * the pool is saturated.
+   *
+   * Waiting rather than failing is the point: a job that arrives while every
+   * thread is busy has not failed, it has not started. Returning an error would
+   * consume one of its retry attempts for something it had no part in, which is
+   * easy to hit whenever a queue's concurrency exceeds `maxThreads`.
+   */
+  private acquireWorker(limits: ResourceLimits | undefined, signal: { aborted: boolean }): Promise<PooledWorker | null> {
+    const limitsKey = limitsKeyFor(limits);
+
+    const immediate = this.takeIdleWorker(limitsKey, limits);
+    if (immediate) return Promise.resolve(immediate);
+
+    return new Promise<PooledWorker | null>(resolve => {
+      const waiter: Waiter = {
+        limitsKey,
+        limits,
+        resolve: worker => {
+          if (signal.aborted) {
+            // The job gave up while queued; hand the thread to the next in line.
+            if (worker) {
+              worker.busy = false;
+              this.handOffToWaiter();
+            }
+            resolve(null);
+            return;
+          }
+          resolve(worker);
+        }
+      };
+
+      this.waiters.push(waiter);
+    });
+  }
+
+  /** Returns a thread ready for `limitsKey`, or null if none can be had now. */
+  private takeIdleWorker(limitsKey: string, limits?: ResourceLimits): PooledWorker | null {
+    const matching = this.workers.find(w => !w.busy && w.limitsKey === limitsKey);
+    if (matching) {
+      matching.busy = true;
+      return matching;
     }
 
     if (this.workers.length < this.config.maxThreads) {
-      return this.createWorker();
+      const created = this.createWorker(limits);
+      created.busy = true;
+      return created;
+    }
+
+    // At capacity with only mismatched idle threads. Limits are fixed at
+    // construction, so the only way to serve this job is to replace one.
+    const mismatched = this.workers.find(w => !w.busy);
+    if (mismatched) {
+      this.removeWorker(mismatched);
+      this.terminateWorker(mismatched);
+      const created = this.createWorker(limits);
+      created.busy = true;
+      return created;
     }
 
     return null;
+  }
+
+  /** Called whenever a thread frees up or the pool gains capacity. */
+  private handOffToWaiter(): void {
+    if (this.shuttingDown) return;
+
+    for (let i = 0; i < this.waiters.length; i++) {
+      const waiter = this.waiters[i];
+      const worker = this.takeIdleWorker(waiter.limitsKey, waiter.limits);
+      if (!worker) return;
+
+      this.waiters.splice(i, 1);
+      waiter.resolve(worker);
+      return;
+    }
+  }
+
+  private removeWorker(pooled: PooledWorker): void {
+    const index = this.workers.indexOf(pooled);
+    if (index !== -1) {
+      this.workers.splice(index, 1);
+    }
   }
 
   private terminateWorker(pooled: PooledWorker): void {
@@ -233,15 +337,36 @@ export class ThreadPool {
       };
     }
 
-    const pooled = this.getAvailableWorker();
-    if (!pooled) {
-      return {
+    // The deadline covers queueing as well as execution, so a saturated pool
+    // cannot leave a job outstanding indefinitely.
+    const signal = { aborted: false };
+    let settle: ((result: WorkerResult) => void) | undefined;
+    const settled = new Promise<WorkerResult>(resolve => {
+      settle = resolve;
+    });
+
+    const waitTimer = setTimeout(() => {
+      signal.aborted = true;
+      this.waiters = this.waiters.filter(w => w.resolve !== waiterResolve);
+      settle?.({
         status: 'error',
-        error: new Error('No available worker threads')
-      };
+        error: new Error(`Timed out after ${timeout}ms waiting for a worker thread`)
+      });
+    }, timeout);
+
+    const waiterResolve = (): void => {};
+
+    const pooled = await Promise.race([
+      this.acquireWorker(options.resourceLimits, signal),
+      settled.then(() => null)
+    ]);
+
+    clearTimeout(waitTimer);
+
+    if (signal.aborted || !pooled) {
+      return settled;
     }
 
-    pooled.busy = true;
     pooled.currentJobId = job.id;
 
     telemetry.emit('job:isolated:start', {
@@ -250,7 +375,7 @@ export class ThreadPool {
       isolated: true
     });
 
-    return new Promise<WorkerResult>((resolve) => {
+    return new Promise<WorkerResult>(resolve => {
       const timeoutId = setTimeout(() => {
         const pending = this.pendingJobs.get(job.id);
         if (pending) {
@@ -263,10 +388,8 @@ export class ThreadPool {
           });
 
           this.terminateWorker(pooled);
-          const index = this.workers.indexOf(pooled);
-          if (index !== -1) {
-            this.workers.splice(index, 1);
-          }
+          this.removeWorker(pooled);
+          this.handOffToWaiter();
 
           resolve({
             status: 'error',
@@ -313,6 +436,12 @@ export class ThreadPool {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+
+    // Nothing will free up now, so release anyone queued rather than leaving
+    // their promises pending forever.
+    const waiting = this.waiters;
+    this.waiters = [];
+    waiting.forEach(w => w.resolve(null));
 
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);

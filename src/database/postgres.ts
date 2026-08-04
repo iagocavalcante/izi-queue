@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from 'pg';
 import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { advisoryLockKey, computeUniqueKey } from '../core/unique.js';
+import { telemetry } from '../core/telemetry.js';
 
 /** Arbitrary but fixed: all izi-queue instances must agree on this value. */
 const MIGRATION_LOCK_KEY = '7451092386401173';
@@ -22,6 +23,8 @@ export class PostgresAdapter extends BaseAdapter {
   private pool: Pool;
   private client?: PoolClient;
   private listening = false;
+  private resubscribing = false;
+  private notificationHandler?: (event: { queue: string }) => void;
   private reconnecting = false;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
@@ -371,20 +374,76 @@ export class PostgresAdapter extends BaseAdapter {
   async listen(callback: (event: { queue: string }) => void): Promise<void> {
     if (this.listening) return;
 
-    this.client = await this.pool.connect();
-    await this.client.query('LISTEN izi_jobs_insert');
     this.listening = true;
+    this.notificationHandler = callback;
+    await this.subscribe();
+  }
 
-    this.client.on('notification', (msg) => {
+  /**
+   * Takes a dedicated connection and starts listening on it.
+   *
+   * The connection is deliberately not returned to the pool: a listener has to
+   * keep the same backend to keep receiving notifications.
+   */
+  private async subscribe(): Promise<void> {
+    const client = await this.pool.connect();
+    this.client = client;
+
+    // A LISTEN connection dies like any other -- failover, an idle reaper, a
+    // network blip. Without re-subscribing, notifications stop arriving
+    // silently and the queue degrades to poll-only with nothing to show for it.
+    client.on('error', () => this.resubscribe());
+    client.on('end', () => this.resubscribe());
+
+    client.on('notification', msg => {
       if (msg.channel === 'izi_jobs_insert' && msg.payload) {
         try {
           const payload = JSON.parse(msg.payload);
-          callback({ queue: payload.queue });
+          this.notificationHandler?.({ queue: payload.queue });
         } catch {
           // Ignore parse errors
         }
       }
     });
+
+    await client.query('LISTEN izi_jobs_insert');
+  }
+
+  private async resubscribe(): Promise<void> {
+    if (!this.listening || this.resubscribing) return;
+    this.resubscribing = true;
+
+    // The old client is gone; release it so the pool can reclaim the slot.
+    try {
+      this.client?.release();
+    } catch {
+      // Already destroyed.
+    }
+    this.client = undefined;
+
+    telemetry.emit('plugin:error', {
+      queue: 'notifier',
+      error: new Error('izi-queue: notification listener disconnected, reconnecting')
+    });
+
+    for (let attempt = 1; this.listening; attempt++) {
+      const delay = Math.min(this.reconnectDelay * 2 ** (attempt - 1), 30000);
+      await new Promise(resolve => setTimeout(resolve, delay));
+
+      if (!this.listening) break;
+
+      try {
+        await this.subscribe();
+        this.resubscribing = false;
+        telemetry.emit('plugin:start', { queue: 'notifier' });
+        return;
+      } catch {
+        // Keep trying: polling still drains the queue meanwhile, so this is a
+        // degradation rather than an outage.
+      }
+    }
+
+    this.resubscribing = false;
   }
 
   async notify(queue: string, tx?: TransactionHandle): Promise<void> {
@@ -396,11 +455,20 @@ export class PostgresAdapter extends BaseAdapter {
   }
 
   async close(): Promise<void> {
+    // Cleared first so an in-flight reconnect gives up instead of racing the
+    // pool shutdown.
+    this.listening = false;
+    this.notificationHandler = undefined;
+
     if (this.client) {
-      this.client.release();
+      try {
+        this.client.release();
+      } catch {
+        // Already destroyed by the disconnect that triggered shutdown.
+      }
       this.client = undefined;
     }
-    this.listening = false;
+
     await this.pool.end();
   }
 }
