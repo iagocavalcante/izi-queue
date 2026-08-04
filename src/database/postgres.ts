@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
-import type { Job, JobState, UniqueOptions } from '../types.js';
-import { BaseAdapter, DEFAULT_NODE_TTL, SQL, rowToJob } from './adapter.js';
+import type { Job, JobCriteria, JobState, UniqueOptions } from '../types.js';
+import { BaseAdapter, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { advisoryLockKey, computeUniqueKey } from '../core/unique.js';
 
 /** Arbitrary but fixed: all izi-queue instances must agree on this value. */
@@ -178,8 +178,12 @@ export class PostgresAdapter extends BaseAdapter {
     return result.rows.map(rowToJob);
   }
 
-  async updateJob(id: number, updates: Partial<Job>): Promise<Job | null> {
-    const result = await this.pool.query(SQL.postgres.updateJob, [
+  async updateJob(
+    id: number,
+    updates: Partial<Job>,
+    expectedStates?: JobState[]
+  ): Promise<Job | null> {
+    const params: unknown[] = [
       id,
       updates.state ?? null,
       updates.errors ? JSON.stringify(updates.errors) : null,
@@ -187,8 +191,35 @@ export class PostgresAdapter extends BaseAdapter {
       updates.discardedAt ?? null,
       updates.cancelledAt ?? null,
       updates.scheduledAt ?? null,
-      updates.meta ? JSON.stringify(updates.meta) : null
-    ]);
+      updates.meta ? JSON.stringify(updates.meta) : null,
+      updates.attempt ?? null,
+      updates.maxAttempts ?? null
+    ];
+
+    let guard = '';
+    if (expectedStates?.length) {
+      params.push(expectedStates);
+      guard = ` AND state = ANY($${params.length})`;
+    }
+
+    const result = await this.pool.query(
+      `
+        UPDATE izi_jobs
+        SET state = COALESCE($2, state),
+            errors = COALESCE($3, errors),
+            completed_at = COALESCE($4, completed_at),
+            discarded_at = COALESCE($5, discarded_at),
+            cancelled_at = COALESCE($6, cancelled_at),
+            scheduled_at = COALESCE($7, scheduled_at),
+            meta = COALESCE($8, meta),
+            attempt = COALESCE($9, attempt),
+            max_attempts = COALESCE($10, max_attempts)
+        WHERE id = $1${guard}
+        RETURNING *
+      `,
+      params
+    );
+
     return result.rows[0] ? rowToJob(result.rows[0]) : null;
   }
 
@@ -207,25 +238,31 @@ export class PostgresAdapter extends BaseAdapter {
     return result.rowCount ?? 0;
   }
 
-  async cancelJobs(criteria: { queue?: string; worker?: string; state?: JobState[] }): Promise<number> {
-    let sql = SQL.postgres.cancelJobs;
-    const params: unknown[] = [];
-    let paramIndex = 1;
+  async cancelJobs(criteria: JobCriteria): Promise<number> {
+    const { clause, params } = criteriaClause(criteria, i => `$${i}`);
+    const result = await this.pool.query(
+      `${SQL.postgres.cancelJobs}${clause}`,
+      params
+    );
+    return result.rowCount ?? 0;
+  }
 
-    if (criteria.queue) {
-      sql += ` AND queue = $${paramIndex++}`;
-      params.push(criteria.queue);
-    }
-    if (criteria.worker) {
-      sql += ` AND worker = $${paramIndex++}`;
-      params.push(criteria.worker);
-    }
-    if (criteria.state && criteria.state.length > 0) {
-      sql += ` AND state = ANY($${paramIndex++})`;
-      params.push(criteria.state);
-    }
-
-    const result = await this.pool.query(sql, params);
+  async retryJobs(criteria: JobCriteria): Promise<number> {
+    const { clause, params } = criteriaClause(criteria, i => `$${i}`);
+    // Raising max_attempts matters for jobs discarded after exhausting them:
+    // without headroom the job is discarded again on its very next fetch.
+    const result = await this.pool.query(
+      `
+        UPDATE izi_jobs
+        SET state = 'available',
+            scheduled_at = NOW(),
+            discarded_at = NULL,
+            cancelled_at = NULL,
+            max_attempts = CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END
+        WHERE state IN ('discarded', 'cancelled')${clause}
+      `,
+      params
+    );
     return result.rowCount ?? 0;
   }
 

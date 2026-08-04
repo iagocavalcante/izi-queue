@@ -40,9 +40,11 @@ export class PrunerPlugin extends BasePlugin {
       const pruned = await this.context.database.pruneJobs(this.config.maxAge);
 
       if (pruned > 0) {
-        telemetry.emit('job:complete', {
+        // Deliberately not `job:complete`: pruning is maintenance, and counting
+        // deleted rows as completed jobs corrupts any metric built on that event.
+        telemetry.emit('jobs:pruned', {
           result: { pruned, maxAge: this.config.maxAge },
-          queue: 'pruner'
+          queue: this.name
         });
       }
     } catch (error) {

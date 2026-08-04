@@ -23,8 +23,8 @@ interface Pool {
   getConnection(): Promise<PoolConnection>;
   end(): Promise<void>;
 }
-import type { Job, JobState, UniqueOptions } from '../types.js';
-import { BaseAdapter, DEFAULT_NODE_TTL, SQL, rowToJob } from './adapter.js';
+import type { Job, JobCriteria, JobState, UniqueOptions } from '../types.js';
+import { BaseAdapter, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 
 /** Arbitrary but fixed: all izi-queue instances must agree on this value. */
@@ -184,8 +184,12 @@ export class MySQLAdapter extends BaseAdapter {
     }
   }
 
-  async updateJob(id: number, updates: Partial<Job>): Promise<Job | null> {
-    await this.pool.query(SQL.mysql.updateJob, [
+  async updateJob(
+    id: number,
+    updates: Partial<Job>,
+    expectedStates?: JobState[]
+  ): Promise<Job | null> {
+    const params: unknown[] = [
       updates.state ?? null,
       updates.errors ? JSON.stringify(updates.errors) : null,
       updates.completedAt ?? null,
@@ -193,9 +197,35 @@ export class MySQLAdapter extends BaseAdapter {
       updates.cancelledAt ?? null,
       updates.scheduledAt ?? null,
       updates.meta ? JSON.stringify(updates.meta) : null,
+      updates.attempt ?? null,
+      updates.maxAttempts ?? null,
       id
-    ]);
+    ];
 
+    let guard = '';
+    if (expectedStates?.length) {
+      guard = ` AND state IN (${expectedStates.map(() => '?').join(',')})`;
+      params.push(...expectedStates);
+    }
+
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `
+        UPDATE izi_jobs
+        SET state = COALESCE(?, state),
+            errors = COALESCE(?, errors),
+            completed_at = COALESCE(?, completed_at),
+            discarded_at = COALESCE(?, discarded_at),
+            cancelled_at = COALESCE(?, cancelled_at),
+            scheduled_at = COALESCE(?, scheduled_at),
+            meta = COALESCE(?, meta),
+            attempt = COALESCE(?, attempt),
+            max_attempts = COALESCE(?, max_attempts)
+        WHERE id = ?${guard}
+      `,
+      params
+    );
+
+    if (result.affectedRows === 0) return null;
     return this.getJob(id);
   }
 
@@ -214,24 +244,31 @@ export class MySQLAdapter extends BaseAdapter {
     return result.affectedRows;
   }
 
-  async cancelJobs(criteria: { queue?: string; worker?: string; state?: JobState[] }): Promise<number> {
-    let sql = SQL.mysql.cancelJobs;
-    const params: unknown[] = [];
+  async cancelJobs(criteria: JobCriteria): Promise<number> {
+    const { clause, params } = criteriaClause(criteria, () => '?');
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `${SQL.mysql.cancelJobs}${clause}`,
+      params
+    );
+    return result.affectedRows;
+  }
 
-    if (criteria.queue) {
-      sql += ' AND queue = ?';
-      params.push(criteria.queue);
-    }
-    if (criteria.worker) {
-      sql += ' AND worker = ?';
-      params.push(criteria.worker);
-    }
-    if (criteria.state && criteria.state.length > 0) {
-      sql += ' AND state IN (?)';
-      params.push(criteria.state);
-    }
-
-    const [result] = await this.pool.query<ResultSetHeader>(sql, params);
+  async retryJobs(criteria: JobCriteria): Promise<number> {
+    const { clause, params } = criteriaClause(criteria, () => '?');
+    // Raising max_attempts matters for jobs discarded after exhausting them:
+    // without headroom the job is discarded again on its very next fetch.
+    const [result] = await this.pool.query<ResultSetHeader>(
+      `
+        UPDATE izi_jobs
+        SET state = 'available',
+            scheduled_at = NOW(6),
+            discarded_at = NULL,
+            cancelled_at = NULL,
+            max_attempts = CASE WHEN attempt >= max_attempts THEN attempt + 1 ELSE max_attempts END
+        WHERE state IN ('discarded', 'cancelled')${clause}
+      `,
+      params
+    );
     return result.affectedRows;
   }
 

@@ -312,6 +312,38 @@ export const SQL = {
   }
 };
 
+/**
+ * Builds the shared filter for bulk job operations. An empty criteria object is
+ * rejected by the caller rather than silently matching every job.
+ */
+export function criteriaClause(
+  criteria: import('../types.js').JobCriteria,
+  placeholder: (index: number) => string
+): { clause: string; params: unknown[] } {
+  const params: unknown[] = [];
+  let clause = '';
+  let index = 1;
+
+  if (criteria.ids && criteria.ids.length > 0) {
+    clause += ` AND id IN (${criteria.ids.map(() => placeholder(index++)).join(',')})`;
+    params.push(...criteria.ids);
+  }
+  if (criteria.queue) {
+    clause += ` AND queue = ${placeholder(index++)}`;
+    params.push(criteria.queue);
+  }
+  if (criteria.worker) {
+    clause += ` AND worker = ${placeholder(index++)}`;
+    params.push(criteria.worker);
+  }
+  if (criteria.state && criteria.state.length > 0) {
+    clause += ` AND state IN (${criteria.state.map(() => placeholder(index++)).join(',')})`;
+    params.push(...criteria.state);
+  }
+
+  return { clause, params };
+}
+
 export function rowToJob(row: Record<string, unknown>): Job {
   const parseJSON = (val: unknown): unknown => {
     if (typeof val === 'string') {
@@ -357,11 +389,11 @@ export abstract class BaseAdapter implements DatabaseAdapter {
   abstract migrate(): Promise<void>;
   abstract insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job>;
   abstract fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]>;
-  abstract updateJob(id: number, updates: Partial<Job>): Promise<Job | null>;
+  abstract updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[]): Promise<Job | null>;
   abstract getJob(id: number): Promise<Job | null>;
   abstract pruneJobs(maxAge: number): Promise<number>;
   abstract stageJobs(): Promise<number>;
-  abstract cancelJobs(criteria: { queue?: string; worker?: string; state?: JobState[] }): Promise<number>;
+  abstract cancelJobs(criteria: import('../types.js').JobCriteria): Promise<number>;
   abstract rescueStuckJobs(rescueAfter: number, nodeTtl?: number): Promise<number>;
 
   /** Shared predicate for locating an existing unique job. */
