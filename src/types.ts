@@ -31,6 +31,8 @@ export interface Job<T = Record<string, unknown>> {
   attemptedAt: Date | null;
   /** Name of the node that last fetched this job. Null for jobs never attempted. */
   attemptedBy: string | null;
+  /** Digest identifying this job for uniqueness. Null for non-unique jobs. */
+  uniqueKey: string | null;
   completedAt: Date | null;
   discardedAt: Date | null;
   cancelledAt: Date | null;
@@ -112,6 +114,7 @@ export interface SerializableJob<T = Record<string, unknown>> {
   scheduledAt: string;
   attemptedAt: string | null;
   attemptedBy: string | null;
+  uniqueKey: string | null;
   completedAt: string | null;
   discardedAt: string | null;
   cancelledAt: string | null;
@@ -158,7 +161,21 @@ export interface DatabaseAdapter {
   heartbeat?(node: string): Promise<void>;
   /** Removes a node's liveness record on graceful shutdown. */
   removeNode?(node: string): Promise<void>;
+  /**
+   * @deprecated Superseded by `insertUnique`, which is atomic. Retained so
+   * third-party adapters keep working; the check-then-insert it supports races
+   * between concurrent callers.
+   */
   checkUnique?(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null>;
+  /**
+   * Inserts a job unless an equivalent one already exists, atomically. Callers
+   * racing on the same unique job must all observe the same outcome: exactly
+   * one insert, and every caller receives the surviving job.
+   */
+  insertUnique?(
+    job: Omit<Job, 'id' | 'insertedAt'>,
+    options: UniqueOptions
+  ): Promise<{ job: Job; conflict: boolean }>;
   close(): Promise<void>;
   listen?(callback: (event: { queue: string }) => void): Promise<void>;
   notify?(queue: string): Promise<void>;

@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
 import { createSQLiteAdapter } from '../src/database/sqlite.js';
-import type { Job, JobState } from '../src/types.js';
+import type { Job, JobState, UniqueOptions } from '../src/types.js';
 
 describe('SQLiteAdapter', () => {
   let db: Database.Database;
@@ -31,6 +31,7 @@ describe('SQLiteAdapter', () => {
       scheduledAt: new Date(),
       attemptedAt: null,
       attemptedBy: null,
+    uniqueKey: null,
       completedAt: null,
       discardedAt: null,
       cancelledAt: null,
@@ -490,116 +491,101 @@ describe('SQLiteAdapter', () => {
     });
   });
 
-  describe('checkUnique', () => {
-    it('should find existing job with same args', async () => {
-      const inserted = await adapter.insertJob(createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 123 }
-      }));
+  describe('unique jobs', () => {
+    // Uniqueness is keyed on a digest stored at insert time, so a job only
+    // participates if it was itself inserted through insertUnique. A job
+    // enqueued without unique options is not unique-tracked.
+    const unique: UniqueOptions = { period: 60 };
 
-      const jobData = createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 123 }
-      });
+    async function insertUnique(
+      overrides: Partial<Omit<Job, 'id' | 'insertedAt'>> = {},
+      options: UniqueOptions = unique
+    ): Promise<{ job: Job; conflict: boolean }> {
+      return adapter.insertUnique(
+        createJobData({ worker: 'UniqueWorker', args: { userId: 123 }, ...overrides }),
+        options
+      );
+    }
 
-      const existing = await adapter.checkUnique({ period: 60 }, jobData);
+    it('conflicts with an equivalent unique job', async () => {
+      const first = await insertUnique();
+      const second = await insertUnique();
 
-      expect(existing).not.toBeNull();
-      expect(existing?.id).toBe(inserted.id);
+      expect(first.conflict).toBe(false);
+      expect(second.conflict).toBe(true);
+      expect(second.job.id).toBe(first.job.id);
     });
 
-    it('should not find job with different args', async () => {
-      await adapter.insertJob(createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 123 }
-      }));
+    it('does not conflict when args differ', async () => {
+      await insertUnique();
+      const other = await insertUnique({ args: { userId: 456 } });
 
-      const jobData = createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 456 }
-      });
-
-      const existing = await adapter.checkUnique({ period: 60 }, jobData);
-
-      expect(existing).toBeNull();
+      expect(other.conflict).toBe(false);
     });
 
-    it('should check only specified keys', async () => {
-      await adapter.insertJob(createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 123, timestamp: 1000 }
-      }));
+    it('ignores key order within args', async () => {
+      const first = await insertUnique({ args: { a: 1, b: 2 } });
+      const second = await insertUnique({ args: { b: 2, a: 1 } });
 
-      const jobData = createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 123, timestamp: 2000 }
-      });
+      expect(second.conflict).toBe(true);
+      expect(second.job.id).toBe(first.job.id);
+    });
 
-      const existing = await adapter.checkUnique(
-        { period: 60, keys: ['userId'] },
-        jobData
+    it('compares only the specified keys', async () => {
+      const options = { period: 60, keys: ['userId'] };
+      await insertUnique({ args: { userId: 1, extra: 'a' } }, options);
+      const second = await insertUnique({ args: { userId: 1, extra: 'b' } }, options);
+
+      expect(second.conflict).toBe(true);
+    });
+
+    it('does not track jobs inserted without unique options', async () => {
+      // Deliberate: uniqueness is a property of how a job was enqueued.
+      await adapter.insertJob(createJobData({ worker: 'UniqueWorker', args: { userId: 123 } }));
+
+      const result = await insertUnique();
+
+      expect(result.conflict).toBe(false);
+    });
+
+    it('respects the period', async () => {
+      const first = await insertUnique();
+      db.prepare(`UPDATE izi_jobs SET inserted_at = datetime('now', '-10 minutes') WHERE id = ?`).run(
+        first.job.id
       );
 
-      expect(existing).not.toBeNull();
+      expect((await insertUnique({}, { period: 300 })).conflict).toBe(false);
+
+      db.prepare('DELETE FROM izi_jobs WHERE id != ?').run(first.job.id);
+      expect((await insertUnique({}, { period: 900 })).conflict).toBe(true);
     });
 
-    it('should respect period constraint', async () => {
-      // Insert a job 10 minutes ago
-      db.prepare(`
-        INSERT INTO izi_jobs (state, queue, worker, args, inserted_at)
-        VALUES ('available', 'default', 'UniqueWorker', '{"userId":123}', datetime('now', '-10 minutes'))
-      `).run();
+    it('respects the configured states', async () => {
+      const first = await insertUnique();
+      db.prepare(`UPDATE izi_jobs SET state = 'completed' WHERE id = ?`).run(first.job.id);
 
-      const jobData = createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 123 }
-      });
+      expect((await insertUnique()).conflict).toBe(false);
 
-      // Check with 5 minute period - should not find
-      const existing5min = await adapter.checkUnique({ period: 300 }, jobData);
-      expect(existing5min).toBeNull();
-
-      // Check with 15 minute period - should find
-      const existing15min = await adapter.checkUnique({ period: 900 }, jobData);
-      expect(existing15min).not.toBeNull();
+      db.prepare('DELETE FROM izi_jobs WHERE id != ?').run(first.job.id);
+      expect((await insertUnique({}, { period: 60, states: ['completed'] })).conflict).toBe(true);
     });
 
-    it('should check specified states', async () => {
-      db.prepare(`
-        INSERT INTO izi_jobs (state, queue, worker, args)
-        VALUES ('completed', 'default', 'UniqueWorker', '{"userId":123}')
-      `).run();
-
-      const jobData = createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 123 }
-      });
-
-      // Default states don't include completed
-      const existingDefault = await adapter.checkUnique({ period: 60 }, jobData);
-      expect(existingDefault).toBeNull();
-
-      // Explicitly include completed
-      const existingWithCompleted = await adapter.checkUnique(
-        { period: 60, states: ['completed'] },
-        jobData
+    it('treats an infinite period as unbounded', async () => {
+      const first = await insertUnique();
+      db.prepare(`UPDATE izi_jobs SET inserted_at = datetime('now', '-365 days') WHERE id = ?`).run(
+        first.job.id
       );
-      expect(existingWithCompleted).not.toBeNull();
+
+      expect((await insertUnique({}, { period: 'infinity' })).conflict).toBe(true);
     });
 
-    it('should handle infinity period', async () => {
-      db.prepare(`
-        INSERT INTO izi_jobs (state, queue, worker, args, inserted_at)
-        VALUES ('available', 'default', 'UniqueWorker', '{"userId":123}', datetime('now', '-365 days'))
-      `).run();
+    it('accepts payloads far larger than a btree index entry', async () => {
+      const blob = 'x'.repeat(20000);
 
-      const jobData = createJobData({
-        worker: 'UniqueWorker',
-        args: { userId: 123 }
-      });
+      const result = await insertUnique({ args: { blob } });
 
-      const existing = await adapter.checkUnique({ period: 'infinity' }, jobData);
-      expect(existing).not.toBeNull();
+      expect(result.conflict).toBe(false);
+      expect(((await adapter.getJob(result.job.id))?.args as { blob: string }).blob).toHaveLength(20000);
     });
   });
 

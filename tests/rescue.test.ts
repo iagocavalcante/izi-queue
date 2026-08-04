@@ -17,6 +17,7 @@ function jobData(overrides: Partial<Job> = {}): Omit<Job, 'id' | 'insertedAt'> {
     scheduledAt: new Date(),
     attemptedAt: null,
     attemptedBy: null,
+    uniqueKey: null,
     completedAt: null,
     discardedAt: null,
     cancelledAt: null,

@@ -28,6 +28,7 @@ function jobData(overrides: Partial<Omit<Job, 'id' | 'insertedAt'>> = {}): Omit<
     scheduledAt: new Date(),
     attemptedAt: null,
     attemptedBy: null,
+    uniqueKey: null,
     completedAt: null,
     discardedAt: null,
     cancelledAt: null,
@@ -205,14 +206,14 @@ describeMySQL('MySQLAdapter', () => {
     expect(await countByState()).toEqual({ available: 1, cancelled: 1, completed: 1 });
   });
 
-  it('detects a duplicate unique job', async () => {
+  it('does not unique-track jobs inserted without unique options', async () => {
+    // Deliberate: uniqueness is a property of how a job was enqueued, so a
+    // plain insert carries no key and cannot conflict with a later one.
     await adapter.insertJob(jobData({ args: { userId: 1 } }));
 
-    const conflict = await adapter.checkUnique({ period: 60 }, jobData({ args: { userId: 1 } }));
-    const distinct = await adapter.checkUnique({ period: 60 }, jobData({ args: { userId: 2 } }));
+    const result = await adapter.insertUnique(jobData({ args: { userId: 1 } }), { period: 60 });
 
-    expect(conflict).not.toBeNull();
-    expect(distinct).toBeNull();
+    expect(result.conflict).toBe(false);
   });
 
   it('prunes only terminal jobs past the age cutoff', async () => {
@@ -226,5 +227,78 @@ describeMySQL('MySQLAdapter', () => {
 
     expect(pruned).toBe(1);
     expect(await countByState()).toEqual({ available: 1 });
+  });
+
+  describe('unique jobs', () => {
+    const unique = { period: 60 };
+
+    it('inserts only one job when many nodes race on the same unique job', async () => {
+      const attempts = 15;
+      const results = await Promise.all(
+        Array.from({ length: attempts }, () =>
+          adapter.insertUnique(jobData({ args: { userId: 7 } }), unique)
+        )
+      );
+
+      expect(results.filter((r) => !r.conflict)).toHaveLength(1);
+      expect(results.filter((r) => r.conflict)).toHaveLength(attempts - 1);
+      expect(new Set(results.map((r) => r.job.id)).size).toBe(1);
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(1);
+    });
+
+    it('does not conflate distinct unique jobs inserted concurrently', async () => {
+      const results = await Promise.all(
+        Array.from({ length: 10 }, (_, i) =>
+          adapter.insertUnique(jobData({ args: { userId: i } }), unique)
+        )
+      );
+
+      expect(results.filter((r) => r.conflict)).toHaveLength(0);
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(10);
+    });
+
+    it('treats args differing only in key order as the same job', async () => {
+      const first = await adapter.insertUnique(jobData({ args: { a: 1, b: 2 } }), unique);
+      const second = await adapter.insertUnique(jobData({ args: { b: 2, a: 1 } }), unique);
+
+      expect(first.conflict).toBe(false);
+      expect(second.conflict).toBe(true);
+      expect(second.job.id).toBe(first.job.id);
+    });
+
+    it('ignores jobs outside the uniqueness period', async () => {
+      await adapter.insertUnique(jobData({ args: { userId: 1 } }), unique);
+      await pool.query('UPDATE izi_jobs SET inserted_at = NOW() - INTERVAL 1 HOUR');
+
+      const second = await adapter.insertUnique(jobData({ args: { userId: 1 } }), unique);
+
+      expect(second.conflict).toBe(false);
+    });
+  });
+
+  describe('concurrent migrations', () => {
+    it('lets several nodes migrate at once without failing', async () => {
+      await pool.query('DROP TABLE IF EXISTS izi_jobs, izi_nodes, izi_migrations');
+
+      const pools = Array.from({ length: 4 }, () =>
+        mysql.createPool({ uri: CONNECTION_STRING, timezone: 'Z' })
+      );
+      try {
+        const results = await Promise.allSettled(
+          pools.map((p) => createMySQLAdapter(p as never).migrate())
+        );
+
+        expect(results.filter((r) => r.status === 'rejected')).toHaveLength(0);
+
+        const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT version FROM izi_migrations');
+        const versions = rows.map((r) => Number(r.version));
+        expect(new Set(versions).size).toBe(versions.length);
+      } finally {
+        await Promise.all(pools.map((p) => p.end()));
+      }
+    });
   });
 });

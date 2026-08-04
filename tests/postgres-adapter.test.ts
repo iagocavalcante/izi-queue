@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { randomBytes } from 'crypto';
 import { createPostgresAdapter, PostgresAdapter } from '../src/database/postgres.js';
 import type { Job } from '../src/types.js';
 
@@ -28,6 +29,7 @@ function jobData(overrides: Partial<Omit<Job, 'id' | 'insertedAt'>> = {}): Omit<
     scheduledAt: new Date(),
     attemptedAt: null,
     attemptedBy: null,
+    uniqueKey: null,
     completedAt: null,
     discardedAt: null,
     cancelledAt: null,
@@ -144,5 +146,115 @@ describePostgres('PostgresAdapter', () => {
     await adapter.removeNode('node-a');
     const after = await pool.query('SELECT name FROM izi_nodes');
     expect(after.rows).toHaveLength(0);
+  });
+
+  describe('unique jobs', () => {
+    const unique = { period: 60 };
+
+    it('inserts only one job when many nodes race on the same unique job', async () => {
+      // The real failure mode: concurrent inserts on separate connections, each
+      // seeing "no conflict" before any of them has committed.
+      const attempts = 20;
+      const results = await Promise.all(
+        Array.from({ length: attempts }, () =>
+          adapter.insertUnique(jobData({ args: { userId: 7 } }), unique)
+        )
+      );
+
+      const inserted = results.filter((r) => !r.conflict);
+      const conflicted = results.filter((r) => r.conflict);
+
+      expect(inserted).toHaveLength(1);
+      expect(conflicted).toHaveLength(attempts - 1);
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(1);
+
+      // Every caller gets a usable job back, and they all point at the same row.
+      const ids = new Set(results.map((r) => r.job.id));
+      expect(ids.size).toBe(1);
+    });
+
+    it('does not conflate distinct unique jobs inserted concurrently', async () => {
+      const results = await Promise.all(
+        Array.from({ length: 10 }, (_, i) =>
+          adapter.insertUnique(jobData({ args: { userId: i } }), unique)
+        )
+      );
+
+      expect(results.filter((r) => r.conflict)).toHaveLength(0);
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(10);
+    });
+
+    it('treats args differing only in key order as the same job', async () => {
+      const first = await adapter.insertUnique(jobData({ args: { a: 1, b: 2 } }), unique);
+      const second = await adapter.insertUnique(jobData({ args: { b: 2, a: 1 } }), unique);
+
+      expect(first.conflict).toBe(false);
+      expect(second.conflict).toBe(true);
+      expect(second.job.id).toBe(first.job.id);
+    });
+
+    it('ignores jobs outside the uniqueness period', async () => {
+      const first = await adapter.insertUnique(jobData({ args: { userId: 1 } }), unique);
+      await pool.query(`UPDATE izi_jobs SET inserted_at = NOW() - INTERVAL '1 hour'`);
+
+      const second = await adapter.insertUnique(jobData({ args: { userId: 1 } }), unique);
+
+      expect(second.conflict).toBe(false);
+      expect(second.job.id).not.toBe(first.job.id);
+    });
+
+    it('ignores jobs in states outside the configured set', async () => {
+      await adapter.insertUnique(jobData({ args: { userId: 1 } }), unique);
+      await pool.query(`UPDATE izi_jobs SET state = 'completed'`);
+
+      const second = await adapter.insertUnique(jobData({ args: { userId: 1 } }), unique);
+
+      expect(second.conflict).toBe(false);
+    });
+
+    it('accepts payloads far larger than a btree index entry', async () => {
+      // Incompressible, so it cannot slip under the limit by being TOASTed.
+      const blob = randomBytes(4000).toString('base64');
+
+      const result = await adapter.insertUnique(jobData({ args: { blob } }), unique);
+
+      expect(result.conflict).toBe(false);
+      expect(((await adapter.getJob(result.job.id))?.args as { blob: string }).blob).toHaveLength(
+        blob.length
+      );
+    });
+
+    it('accepts a large payload on a plain insert too', async () => {
+      const blob = randomBytes(4000).toString('base64');
+
+      const job = await adapter.insertJob(jobData({ args: { blob } }));
+
+      expect(job.id).toBeGreaterThan(0);
+    });
+  });
+
+  describe('concurrent migrations', () => {
+    it('lets several nodes migrate at once without failing', async () => {
+      await pool.query('DROP TABLE IF EXISTS izi_jobs, izi_nodes, izi_migrations');
+
+      const pools = Array.from({ length: 4 }, () => new pg.Pool({ connectionString: CONNECTION_STRING }));
+      try {
+        const results = await Promise.allSettled(
+          pools.map((p) => createPostgresAdapter(p).migrate())
+        );
+
+        const rejected = results.filter((r) => r.status === 'rejected');
+        expect(rejected).toHaveLength(0);
+
+        const { rows } = await pool.query('SELECT version FROM izi_migrations ORDER BY version');
+        const versions = rows.map((r) => Number(r.version));
+        expect(new Set(versions).size).toBe(versions.length);
+      } finally {
+        await Promise.all(pools.map((p) => p.end()));
+      }
+    });
   });
 });

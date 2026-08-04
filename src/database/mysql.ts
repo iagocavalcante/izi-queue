@@ -25,6 +25,10 @@ interface Pool {
 }
 import type { Job, JobState, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_NODE_TTL, SQL, rowToJob } from './adapter.js';
+import { computeUniqueKey } from '../core/unique.js';
+
+/** Arbitrary but fixed: all izi-queue instances must agree on this value. */
+const MIGRATION_LOCK_NAME = 'izi_queue_migrations';
 import { mysqlMigrations } from './migrations.js';
 
 export class MySQLAdapter extends BaseAdapter {
@@ -36,7 +40,20 @@ export class MySQLAdapter extends BaseAdapter {
   }
 
   async migrate(): Promise<void> {
-    await this.pool.query(`
+    const connection = await this.pool.getConnection();
+    try {
+      // Serialises concurrent boots; without it two instances racing the same
+      // version both apply it and the second fails on the primary key.
+      await connection.query('SELECT GET_LOCK(?, ?)', [MIGRATION_LOCK_NAME, 60]);
+      await this.runMigrations(connection);
+    } finally {
+      await connection.query('SELECT RELEASE_LOCK(?)', [MIGRATION_LOCK_NAME]).catch(() => {});
+      connection.release();
+    }
+  }
+
+  private async runMigrations(connection: PoolConnection): Promise<void> {
+    await connection.query(`
       CREATE TABLE IF NOT EXISTS izi_migrations (
         version INT PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
@@ -44,37 +61,25 @@ export class MySQLAdapter extends BaseAdapter {
       )
     `);
 
-    const [rows] = await this.pool.query<RowDataPacket[]>('SELECT version FROM izi_migrations ORDER BY version');
+    const [rows] = await connection.query<RowDataPacket[]>('SELECT version FROM izi_migrations ORDER BY version');
     const appliedVersions = new Set(rows.map((r: RowDataPacket) => r.version as number));
 
     for (const migration of mysqlMigrations) {
-      if (!appliedVersions.has(migration.version)) {
-        console.warn(`[izi-queue] Applying migration ${migration.version}: ${migration.name}`);
+      if (appliedVersions.has(migration.version)) continue;
 
-        const connection = await this.pool.getConnection();
-        try {
-          await connection.beginTransaction();
+      console.warn(`[izi-queue] Applying migration ${migration.version}: ${migration.name}`);
 
-          const statements = migration.up.split(';').filter(s => s.trim());
-          for (const stmt of statements) {
-            if (stmt.trim()) {
-              await connection.query(stmt);
-            }
-          }
-
-          await connection.query(
-            'INSERT INTO izi_migrations (version, name) VALUES (?, ?)',
-            [migration.version, migration.name]
-          );
-
-          await connection.commit();
-        } catch (error) {
-          await connection.rollback();
-          throw error;
-        } finally {
-          connection.release();
-        }
+      // DDL is not transactional in MySQL, so a failure part-way leaves the
+      // schema changed but the version unrecorded. The lock at least stops two
+      // nodes doing it at the same time.
+      for (const statement of migration.up) {
+        await connection.query(statement);
       }
+
+      await connection.query(
+        'INSERT INTO izi_migrations (version, name) VALUES (?, ?)',
+        [migration.version, migration.name]
+      );
     }
   }
 
@@ -92,7 +97,9 @@ export class MySQLAdapter extends BaseAdapter {
         const connection = await this.pool.getConnection();
         try {
           await connection.beginTransaction();
-          await connection.query(migration.down);
+          for (const statement of migration.down) {
+            await connection.query(statement);
+          }
           await connection.query('DELETE FROM izi_migrations WHERE version = ?', [migration.version]);
           await connection.commit();
         } catch (error) {
@@ -128,7 +135,8 @@ export class MySQLAdapter extends BaseAdapter {
       job.attempt,
       job.maxAttempts,
       job.priority,
-      job.scheduledAt
+      job.scheduledAt,
+      job.uniqueKey ?? null
     ]);
 
     const insertedJob = await this.getJob(result.insertId);
@@ -247,45 +255,79 @@ export class MySQLAdapter extends BaseAdapter {
     await this.pool.query(SQL.mysql.removeNode, [node]);
   }
 
+  private uniqueLookupSql(withPeriod: boolean): string {
+    return `
+      SELECT * FROM izi_jobs
+      WHERE unique_key = ?
+        AND state IN (?)
+        ${withPeriod ? 'AND inserted_at > DATE_SUB(NOW(), INTERVAL ? SECOND)' : ''}
+      ORDER BY id ASC
+      LIMIT 1
+    `;
+  }
+
   async checkUnique(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null> {
-    const fields = options.fields ?? ['worker', 'queue', 'args'];
-    const states = options.states ?? ['available', 'scheduled', 'executing', 'retryable'];
-    const period = options.period === 'infinity' ? 999999999 : (options.period ?? 60);
+    const { states, period } = this.uniqueLookup(options);
+    const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
+    const params: unknown[] = period !== null ? [uniqueKey, states, period] : [uniqueKey, states];
 
-    let sql = 'SELECT * FROM izi_jobs WHERE state IN (?)';
-    const params: unknown[] = [states];
-
-    if (period !== 999999999) {
-      sql += ' AND inserted_at > DATE_SUB(NOW(), INTERVAL ? SECOND)';
-      params.push(period);
-    }
-
-    if (fields.includes('worker')) {
-      sql += ' AND worker = ?';
-      params.push(job.worker);
-    }
-
-    if (fields.includes('queue')) {
-      sql += ' AND queue = ?';
-      params.push(job.queue);
-    }
-
-    if (fields.includes('args')) {
-      if (options.keys && options.keys.length > 0) {
-        for (const key of options.keys) {
-          sql += ` AND JSON_EXTRACT(args, '$.${key}') = ?`;
-          params.push(JSON.stringify((job.args as Record<string, unknown>)[key] ?? null));
-        }
-      } else {
-        sql += ' AND args = CAST(? AS JSON)';
-        params.push(JSON.stringify(job.args));
-      }
-    }
-
-    sql += ' LIMIT 1';
-
-    const [rows] = await this.pool.query<RowDataPacket[]>(sql, params);
+    const [rows] = await this.pool.query<RowDataPacket[]>(this.uniqueLookupSql(period !== null), params);
     return rows[0] ? rowToJob(rows[0] as Record<string, unknown>) : null;
+  }
+
+  async insertUnique(
+    job: Omit<Job, 'id' | 'insertedAt'>,
+    options: UniqueOptions
+  ): Promise<{ job: Job; conflict: boolean }> {
+    const { states, period } = this.uniqueLookup(options);
+    const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
+    // GET_LOCK names are capped at 64 characters; the digest is 32.
+    const lockName = `izi_unique_${uniqueKey}`;
+
+    const connection = await this.pool.getConnection();
+    try {
+      // Connection-scoped rather than transaction-scoped, so it must be
+      // released explicitly -- see the finally block.
+      await connection.query('SELECT GET_LOCK(?, ?)', [lockName, 10]);
+      await connection.beginTransaction();
+
+      const params: unknown[] = period !== null ? [uniqueKey, states, period] : [uniqueKey, states];
+      const [existing] = await connection.query<RowDataPacket[]>(
+        this.uniqueLookupSql(period !== null),
+        params
+      );
+
+      if (existing[0]) {
+        await connection.commit();
+        return { job: rowToJob(existing[0] as Record<string, unknown>), conflict: true };
+      }
+
+      const [result] = await connection.query<ResultSetHeader>(SQL.mysql.insertJob, [
+        job.state,
+        job.queue,
+        job.worker,
+        JSON.stringify(job.args),
+        JSON.stringify(job.meta),
+        JSON.stringify(job.tags),
+        JSON.stringify(job.errors),
+        job.attempt,
+        job.maxAttempts,
+        job.priority,
+        job.scheduledAt,
+        uniqueKey
+      ]);
+
+      await connection.commit();
+
+      const [rows] = await connection.query<RowDataPacket[]>(SQL.mysql.getJob, [result.insertId]);
+      return { job: rowToJob(rows[0] as Record<string, unknown>), conflict: false };
+    } catch (error) {
+      await connection.rollback().catch(() => {});
+      throw error;
+    } finally {
+      await connection.query('SELECT RELEASE_LOCK(?)', [lockName]).catch(() => {});
+      connection.release();
+    }
   }
 
   async close(): Promise<void> {

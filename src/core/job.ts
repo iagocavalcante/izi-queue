@@ -43,6 +43,7 @@ export function createJob<T = Record<string, unknown>>(
     scheduledAt,
     attemptedAt: null,
     attemptedBy: null,
+    uniqueKey: null,
     completedAt: null,
     discardedAt: null,
     cancelledAt: null

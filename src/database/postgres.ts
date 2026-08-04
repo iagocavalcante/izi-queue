@@ -1,6 +1,21 @@
 import type { Pool, PoolClient } from 'pg';
 import type { Job, JobState, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_NODE_TTL, SQL, rowToJob } from './adapter.js';
+import { advisoryLockKey, computeUniqueKey } from '../core/unique.js';
+
+/** Arbitrary but fixed: all izi-queue instances must agree on this value. */
+const MIGRATION_LOCK_KEY = '7451092386401173';
+
+function uniqueLookupSql(withPeriod: boolean): string {
+  return `
+    SELECT * FROM izi_jobs
+    WHERE unique_key = $1
+      AND state = ANY($2)
+      ${withPeriod ? "AND inserted_at > NOW() - INTERVAL '1 second' * $3" : ''}
+    ORDER BY id ASC
+    LIMIT 1
+  `;
+}
 import { postgresMigrations } from './migrations.js';
 
 export class PostgresAdapter extends BaseAdapter {
@@ -50,7 +65,21 @@ export class PostgresAdapter extends BaseAdapter {
   }
 
   async migrate(): Promise<void> {
-    await this.pool.query(`
+    const client = await this.pool.connect();
+    try {
+      // Serialises concurrent boots. Without it, two instances starting at once
+      // both see the same version missing, both run it, and the second fails on
+      // the primary key -- so a rolling deploy can crash a fresh node.
+      await client.query('SELECT pg_advisory_lock($1)', [MIGRATION_LOCK_KEY]);
+      await this.runMigrations(client);
+    } finally {
+      await client.query('SELECT pg_advisory_unlock($1)', [MIGRATION_LOCK_KEY]).catch(() => {});
+      client.release();
+    }
+  }
+
+  private async runMigrations(client: PoolClient): Promise<void> {
+    await client.query(`
       CREATE TABLE IF NOT EXISTS izi_migrations (
         version INTEGER PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
@@ -58,36 +87,30 @@ export class PostgresAdapter extends BaseAdapter {
       )
     `);
 
-    const result = await this.pool.query('SELECT version FROM izi_migrations ORDER BY version');
+    const result = await client.query('SELECT version FROM izi_migrations ORDER BY version');
     const appliedVersions = new Set(result.rows.map(r => r.version));
 
     for (const migration of postgresMigrations) {
-      if (!appliedVersions.has(migration.version)) {
-        console.log(`[izi-queue] Applying migration ${migration.version}: ${migration.name}`);
+      if (appliedVersions.has(migration.version)) continue;
 
-        const client = await this.pool.connect();
-        try {
-          await client.query('BEGIN');
+      console.log(`[izi-queue] Applying migration ${migration.version}: ${migration.name}`);
 
-          const statements = migration.up.split(';').filter(s => s.trim());
-          for (const stmt of statements) {
-            if (stmt.trim()) {
-              await client.query(stmt);
-            }
-          }
+      try {
+        await client.query('BEGIN');
 
-          await client.query(
-            'INSERT INTO izi_migrations (version, name) VALUES ($1, $2)',
-            [migration.version, migration.name]
-          );
-
-          await client.query('COMMIT');
-        } catch (error) {
-          await client.query('ROLLBACK');
-          throw error;
-        } finally {
-          client.release();
+        for (const statement of migration.up) {
+          await client.query(statement);
         }
+
+        await client.query(
+          'INSERT INTO izi_migrations (version, name) VALUES ($1, $2)',
+          [migration.version, migration.name]
+        );
+
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
       }
     }
   }
@@ -106,7 +129,9 @@ export class PostgresAdapter extends BaseAdapter {
         const client = await this.pool.connect();
         try {
           await client.query('BEGIN');
-          await client.query(migration.down);
+          for (const statement of migration.down) {
+            await client.query(statement);
+          }
           await client.query('DELETE FROM izi_migrations WHERE version = $1', [migration.version]);
           await client.query('COMMIT');
         } catch (error) {
@@ -142,7 +167,8 @@ export class PostgresAdapter extends BaseAdapter {
       job.attempt,
       job.maxAttempts,
       job.priority,
-      job.scheduledAt
+      job.scheduledAt,
+      job.uniqueKey ?? null
     ]);
     return rowToJob(result.rows[0]);
   }
@@ -221,45 +247,63 @@ export class PostgresAdapter extends BaseAdapter {
   }
 
   async checkUnique(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null> {
-    const fields = options.fields ?? ['worker', 'queue', 'args'];
-    const states = options.states ?? ['available', 'scheduled', 'executing', 'retryable'];
-    const period = options.period === 'infinity' ? 999999999 : (options.period ?? 60);
-
-    let sql = 'SELECT * FROM izi_jobs WHERE state = ANY($1)';
-    const params: unknown[] = [states];
-    let paramIndex = 2;
-
-    if (period !== 999999999) {
-      sql += ` AND inserted_at > NOW() - INTERVAL '1 second' * $${paramIndex++}`;
-      params.push(period);
-    }
-
-    if (fields.includes('worker')) {
-      sql += ` AND worker = $${paramIndex++}`;
-      params.push(job.worker);
-    }
-
-    if (fields.includes('queue')) {
-      sql += ` AND queue = $${paramIndex++}`;
-      params.push(job.queue);
-    }
-
-    if (fields.includes('args')) {
-      if (options.keys && options.keys.length > 0) {
-        for (const key of options.keys) {
-          sql += ` AND args->>'${key}' = $${paramIndex++}`;
-          params.push(String((job.args as Record<string, unknown>)[key] ?? ''));
-        }
-      } else {
-        sql += ` AND args = $${paramIndex++}`;
-        params.push(JSON.stringify(job.args));
-      }
-    }
-
-    sql += ' LIMIT 1';
-
-    const result = await this.pool.query(sql, params);
+    const { states, period } = this.uniqueLookup(options);
+    const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
+    const result = await this.pool.query(
+      uniqueLookupSql(period !== null),
+      period !== null ? [uniqueKey, states, period] : [uniqueKey, states]
+    );
     return result.rows[0] ? rowToJob(result.rows[0]) : null;
+  }
+
+  async insertUnique(
+    job: Omit<Job, 'id' | 'insertedAt'>,
+    options: UniqueOptions
+  ): Promise<{ job: Job; conflict: boolean }> {
+    const { states, period } = this.uniqueLookup(options);
+    const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
+
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Held until commit, so a concurrent caller with the same unique key
+      // waits here and then sees the committed row rather than an empty result.
+      await client.query('SELECT pg_advisory_xact_lock($1)', [advisoryLockKey(uniqueKey)]);
+
+      const existing = await client.query(
+        uniqueLookupSql(period !== null),
+        period !== null ? [uniqueKey, states, period] : [uniqueKey, states]
+      );
+
+      if (existing.rows[0]) {
+        await client.query('COMMIT');
+        return { job: rowToJob(existing.rows[0]), conflict: true };
+      }
+
+      const inserted = await client.query(SQL.postgres.insertJob, [
+        job.state,
+        job.queue,
+        job.worker,
+        JSON.stringify(job.args),
+        JSON.stringify(job.meta),
+        job.tags,
+        JSON.stringify(job.errors),
+        job.attempt,
+        job.maxAttempts,
+        job.priority,
+        job.scheduledAt,
+        uniqueKey
+      ]);
+
+      await client.query('COMMIT');
+      return { job: rowToJob(inserted.rows[0]), conflict: false };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async listen(callback: (event: { queue: string }) => void): Promise<void> {

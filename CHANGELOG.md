@@ -6,6 +6,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below 1.0.0, breaking changes are released as minor versions.
 
+## [Unreleased]
+
+### Fixed
+
+- **Unique job keys could alter the SQL they were looked up with.** `unique.keys`
+  entries were interpolated straight into the query in all three adapters. Keys
+  are now hashed in JavaScript and never reach a query, so the injection vector
+  is gone rather than merely parameterised. ([#18])
+- **Unique jobs were not actually unique.** The check and the insert were
+  separate statements with no lock, so concurrent callers all saw "no conflict"
+  and all inserted. Measured on PostgreSQL: 20 simultaneous inserts of the same
+  unique job produced **3 rows**. They now produce exactly one, guarded by an
+  advisory lock on PostgreSQL, `GET_LOCK` on MySQL, and an immediate transaction
+  on SQLite. ([#19])
+- **Jobs with payloads over roughly 2.7KB could not be inserted on PostgreSQL.**
+  A btree index covered the raw `args` column, and a JSONB value that does not
+  compress below the btree entry limit fails the insert outright with
+  `index row size N exceeds btree version 4 maximum 2704`. The index is now on a
+  fixed-width digest. ([#20])
+- **Duplicate detection disagreed between adapters.** SQLite compared serialized
+  JSON, so `{a:1,b:2}` and `{b:2,a:1}` were different jobs; PostgreSQL compared
+  JSONB and considered them the same. All adapters now agree, because the
+  comparison happens on a canonicalized digest computed before the query.
+  ([#45])
+- **Concurrent boots could crash on migrations.** Two instances starting at once
+  both saw the same version missing, both applied it, and the second failed on
+  the primary key -- so a rolling deploy could kill a fresh node. Migrations now
+  hold an advisory lock. Verified with 6 simultaneous migrators. ([#25])
+- **Migration SQL is no longer split on `;`.** Statements are declared as
+  arrays, so a future migration containing a function body, trigger, or a
+  semicolon inside a string literal will not be silently torn in half. ([#25])
+
+### Added
+
+- `computeUniqueKey` and `advisoryLockKey` are exported for adapter authors.
+- `DatabaseAdapter.insertUnique`, an atomic insert-if-absent. Optional, so
+  existing adapters keep working; those that do not implement it fall back to
+  the previous non-atomic path.
+- `Job.uniqueKey` records the digest a unique job was inserted under.
+
+### Breaking
+
+- **Uniqueness now only considers jobs that were themselves inserted with
+  `unique` options.** Previously a job enqueued without `unique` could block a
+  later unique insert, because the comparison was made against raw args. A
+  plain insert now carries no unique key and does not participate. Two unique
+  inserts still deduplicate, and now do so atomically. This matches Oban, where
+  uniqueness is a property of how a job was enqueued.
+- `Job.uniqueKey` is a required field on the `Job` interface. Code constructing
+  `Job` literals must add it; use `uniqueKey: null`.
+- `Migration.up` and `Migration.down` are `string[]` rather than `string`. Only
+  affects code importing the migration definitions directly.
+
+### Migrations
+
+- PostgreSQL 7, SQLite 6, MySQL 6 -- add `unique_key`, index it, and drop the
+  index over raw `args`.
+
 ## [0.4.1] - 2026-08-04
 
 ### Fixed
@@ -111,7 +169,12 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#15]: https://github.com/iagocavalcante/izi-queue/issues/15
 [#16]: https://github.com/iagocavalcante/izi-queue/issues/16
 [#17]: https://github.com/iagocavalcante/izi-queue/issues/17
+[#18]: https://github.com/iagocavalcante/izi-queue/issues/18
+[#19]: https://github.com/iagocavalcante/izi-queue/issues/19
+[#20]: https://github.com/iagocavalcante/izi-queue/issues/20
+[#25]: https://github.com/iagocavalcante/izi-queue/issues/25
 [#38]: https://github.com/iagocavalcante/izi-queue/issues/38
+[#45]: https://github.com/iagocavalcante/izi-queue/issues/45
 [#47]: https://github.com/iagocavalcante/izi-queue/pull/47
 [#50]: https://github.com/iagocavalcante/izi-queue/issues/50
 [0.4.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.3.0...v0.4.0
