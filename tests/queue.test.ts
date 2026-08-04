@@ -49,6 +49,7 @@ describe('Queue Class', () => {
       priority: 0,
       scheduledAt: new Date(),
       attemptedAt: null,
+      attemptedBy: null,
       completedAt: null,
       discardedAt: null,
       cancelledAt: null,

@@ -27,6 +27,7 @@ function createMockJob(overrides: Partial<Job> = {}): Job {
     insertedAt: new Date(),
     scheduledAt: new Date(),
     attemptedAt: new Date(),
+    attemptedBy: null,
     completedAt: null,
     discardedAt: null,
     cancelledAt: null,

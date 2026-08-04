@@ -1,6 +1,6 @@
 import type { Database } from 'better-sqlite3';
 import type { Job, JobState, UniqueOptions } from '../types.js';
-import { BaseAdapter, rowToJob } from './adapter.js';
+import { BaseAdapter, DEFAULT_NODE_TTL, rowToJob } from './adapter.js';
 import { sqliteMigrations } from './migrations.js';
 
 export class SQLiteAdapter extends BaseAdapter {
@@ -99,7 +99,7 @@ export class SQLiteAdapter extends BaseAdapter {
     return rowToJob(row);
   }
 
-  async fetchJobs(queue: string, limit: number): Promise<Job[]> {
+  async fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]> {
     const transaction = this.db.transaction(() => {
       const selectStmt = this.db.prepare(`
         SELECT id FROM izi_jobs
@@ -116,10 +116,11 @@ export class SQLiteAdapter extends BaseAdapter {
 
       const updateStmt = this.db.prepare(`
         UPDATE izi_jobs
-        SET state = 'executing', attempted_at = datetime('now'), attempt = attempt + 1
+        SET state = 'executing', attempted_at = datetime('now'), attempt = attempt + 1,
+            attempted_by = ?
         WHERE id IN (${placeholders})
       `);
-      updateStmt.run(...ids);
+      updateStmt.run(node ?? null, ...ids);
 
       const fetchStmt = this.db.prepare(`
         SELECT * FROM izi_jobs WHERE id IN (${placeholders})
@@ -181,7 +182,7 @@ export class SQLiteAdapter extends BaseAdapter {
     const stmt = this.db.prepare(`
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state = 'scheduled' AND datetime(scheduled_at) <= datetime('now')
+      WHERE state IN ('scheduled', 'retryable') AND datetime(scheduled_at) <= datetime('now')
     `);
     const result = stmt.run();
     return result.changes;
@@ -213,15 +214,45 @@ export class SQLiteAdapter extends BaseAdapter {
     return result.changes;
   }
 
-  async rescueStuckJobs(rescueAfter: number): Promise<number> {
+  async rescueStuckJobs(rescueAfter: number, nodeTtl = DEFAULT_NODE_TTL): Promise<number> {
     const stmt = this.db.prepare(`
       UPDATE izi_jobs
-      SET state = 'available', scheduled_at = datetime('now')
+      SET state = CASE WHEN attempt >= max_attempts THEN 'discarded' ELSE 'available' END,
+          scheduled_at = datetime('now'),
+          discarded_at = CASE WHEN attempt >= max_attempts THEN datetime('now') ELSE discarded_at END
       WHERE state = 'executing'
         AND datetime(attempted_at) < datetime('now', '-' || ? || ' seconds')
+        AND (
+          attempted_by IS NULL
+          OR attempted_by NOT IN (
+            SELECT name FROM izi_nodes
+            WHERE datetime(heartbeat_at) > datetime('now', '-' || ? || ' seconds')
+          )
+        )
     `);
-    const result = stmt.run(rescueAfter);
+    const result = stmt.run(rescueAfter, nodeTtl);
     return result.changes;
+  }
+
+  async heartbeat(node: string): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO izi_nodes (name, heartbeat_at) VALUES (?, datetime('now'))
+         ON CONFLICT(name) DO UPDATE SET heartbeat_at = datetime('now')`
+      )
+      .run(node);
+
+    // Node names are per-process, so a long-lived deployment would otherwise
+    // accumulate one dead row per restart.
+    this.db
+      .prepare(
+        `DELETE FROM izi_nodes WHERE datetime(heartbeat_at) < datetime('now', '-' || ? || ' seconds')`
+      )
+      .run(DEFAULT_NODE_TTL * 20);
+  }
+
+  async removeNode(node: string): Promise<void> {
+    this.db.prepare('DELETE FROM izi_nodes WHERE name = ?').run(node);
   }
 
   async checkUnique(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null> {

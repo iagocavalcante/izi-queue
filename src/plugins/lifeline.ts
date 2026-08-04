@@ -39,7 +39,10 @@ export class LifelinePlugin extends BasePlugin {
     if (!this.context || !this.running) return;
 
     try {
-      const rescued = await this.context.database.rescueStuckJobs(this.config.rescueAfter);
+      const rescued = await this.context.database.rescueStuckJobs(
+        this.config.rescueAfter,
+        this.context.nodeTtl
+      );
 
       if (rescued > 0) {
         telemetry.emit('job:rescue', {

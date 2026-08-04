@@ -42,6 +42,7 @@ export function createJob<T = Record<string, unknown>>(
     priority: options.priority ?? 0,
     scheduledAt,
     attemptedAt: null,
+    attemptedBy: null,
     completedAt: null,
     discardedAt: null,
     cancelledAt: null

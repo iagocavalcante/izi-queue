@@ -67,6 +67,43 @@ export const postgresMigrations: Migration[] = [
       WHERE state = 'executing';
     `,
     down: 'DROP INDEX IF EXISTS izi_jobs_executing_attempted_idx;'
+  },
+  {
+    version: 5,
+    name: 'widen_stager_index_to_retryable',
+    up: `
+      CREATE INDEX IF NOT EXISTS izi_jobs_stageable_idx
+      ON izi_jobs (scheduled_at)
+      WHERE state IN ('scheduled', 'retryable');
+
+      DROP INDEX IF EXISTS izi_jobs_scheduled_at_idx;
+    `,
+    down: `
+      CREATE INDEX IF NOT EXISTS izi_jobs_scheduled_at_idx
+      ON izi_jobs (scheduled_at)
+      WHERE state = 'scheduled';
+
+      DROP INDEX IF EXISTS izi_jobs_stageable_idx;
+    `
+  },
+  {
+    version: 6,
+    name: 'add_node_ownership',
+    up: `
+      ALTER TABLE izi_jobs ADD COLUMN IF NOT EXISTS attempted_by VARCHAR(255);
+
+      CREATE TABLE IF NOT EXISTS izi_nodes (
+        name VARCHAR(255) PRIMARY KEY,
+        started_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        heartbeat_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS izi_nodes_heartbeat_idx ON izi_nodes (heartbeat_at);
+    `,
+    down: `
+      DROP TABLE IF EXISTS izi_nodes;
+      ALTER TABLE izi_jobs DROP COLUMN IF EXISTS attempted_by;
+    `
   }
 ];
 
@@ -130,6 +167,22 @@ export const sqliteMigrations: Migration[] = [
       ON izi_jobs (attempted_at);
     `,
     down: 'DROP INDEX IF EXISTS izi_jobs_executing_attempted_idx;'
+  },
+  {
+    version: 5,
+    name: 'add_node_ownership',
+    up: `
+      ALTER TABLE izi_jobs ADD COLUMN attempted_by TEXT;
+
+      CREATE TABLE IF NOT EXISTS izi_nodes (
+        name TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        heartbeat_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE INDEX IF NOT EXISTS izi_nodes_heartbeat_idx ON izi_nodes (heartbeat_at);
+    `,
+    down: 'DROP TABLE IF EXISTS izi_nodes;'
   }
 ];
 
@@ -190,5 +243,20 @@ export const mysqlMigrations: Migration[] = [
       CREATE INDEX izi_jobs_attempted_at_idx ON izi_jobs (attempted_at);
     `,
     down: 'DROP INDEX izi_jobs_attempted_at_idx ON izi_jobs;'
+  },
+  {
+    version: 5,
+    name: 'add_node_ownership',
+    up: `
+      ALTER TABLE izi_jobs ADD COLUMN attempted_by VARCHAR(255) NULL;
+
+      CREATE TABLE IF NOT EXISTS izi_nodes (
+        name VARCHAR(255) PRIMARY KEY,
+        started_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        heartbeat_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        INDEX idx_heartbeat (heartbeat_at)
+      );
+    `,
+    down: 'DROP TABLE IF EXISTS izi_nodes;'
   }
 ];

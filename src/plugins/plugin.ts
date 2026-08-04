@@ -8,6 +8,8 @@ export interface PluginContext {
   database: DatabaseAdapter;
   node: string;
   queues: string[];
+  /** Seconds without a heartbeat after which a node is presumed dead. */
+  nodeTtl?: number;
 }
 
 export interface Plugin {

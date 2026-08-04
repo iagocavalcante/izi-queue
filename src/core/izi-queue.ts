@@ -23,6 +23,7 @@ import {
   getIsolationStats
 } from './worker.js';
 import { randomUUID } from 'crypto';
+import { DEFAULT_NODE_TTL } from '../database/adapter.js';
 
 export interface IziQueueFullConfig extends IziQueueConfig {
   plugins?: Plugin[];
@@ -41,6 +42,7 @@ export class IziQueue {
   };
   private queues: Map<string, Queue> = new Map();
   private stageTimer?: ReturnType<typeof setInterval>;
+  private heartbeatTimer?: ReturnType<typeof setInterval>;
   private started = false;
 
   constructor(config: IziQueueFullConfig) {
@@ -60,6 +62,7 @@ export class IziQueue {
       node: config.node ?? `node-${randomUUID().slice(0, 8)}`,
       stageInterval: config.stageInterval ?? 1000,
       shutdownGracePeriod: config.shutdownGracePeriod ?? 15000,
+      heartbeatInterval: config.heartbeatInterval ?? 15000,
       pollInterval: config.pollInterval ?? 1000,
       isolation: config.isolation
     };
@@ -99,8 +102,25 @@ export class IziQueue {
     return this;
   }
 
+  /**
+   * Seconds without a heartbeat after which this node is presumed dead. Derived
+   * from the heartbeat interval so a slow heartbeat can never make a live node
+   * look dead and get its running jobs rescued out from under it.
+   */
+  private get nodeTtl(): number {
+    return Math.max(DEFAULT_NODE_TTL, Math.ceil((this.config.heartbeatInterval * 4) / 1000));
+  }
+
   async start(): Promise<void> {
     if (this.started) return;
+
+    // Register before any job can be claimed, otherwise this node's first jobs
+    // are owned by a node that the rescuer has never heard of.
+    await this.recordHeartbeat();
+    this.heartbeatTimer = setInterval(
+      () => this.recordHeartbeat(),
+      this.config.heartbeatInterval
+    );
 
     for (const queueConfig of this.config.queues) {
       const queue = new Queue(queueConfig, this.config.database, this.config.node);
@@ -125,7 +145,8 @@ export class IziQueue {
     const pluginContext: PluginContext = {
       database: this.config.database,
       node: this.config.node,
-      queues: Array.from(this.queues.keys())
+      queues: Array.from(this.queues.keys()),
+      nodeTtl: this.nodeTtl
     };
 
     for (const plugin of this.config.plugins) {
@@ -147,13 +168,38 @@ export class IziQueue {
       this.stageTimer = undefined;
     }
 
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+
     await Promise.all(
       Array.from(this.queues.values()).map(q =>
         q.stop(this.config.shutdownGracePeriod)
       )
     );
 
+    // Deregister only after the grace period: anything still executing at this
+    // point really has been abandoned and should become rescuable promptly.
+    await this.removeNodeRecord();
+
     this.started = false;
+  }
+
+  private async recordHeartbeat(): Promise<void> {
+    try {
+      await this.config.database.heartbeat?.(this.config.node);
+    } catch (error) {
+      console.error('[izi-queue] Error recording node heartbeat:', error);
+    }
+  }
+
+  private async removeNodeRecord(): Promise<void> {
+    try {
+      await this.config.database.removeNode?.(this.config.node);
+    } catch (error) {
+      console.error('[izi-queue] Error removing node record:', error);
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -242,7 +288,7 @@ export class IziQueue {
   }
 
   async rescueStuckJobs(rescueAfterSeconds = 300): Promise<number> {
-    return this.config.database.rescueStuckJobs(rescueAfterSeconds);
+    return this.config.database.rescueStuckJobs(rescueAfterSeconds, this.nodeTtl);
   }
 
   pauseQueue(name: string): void {

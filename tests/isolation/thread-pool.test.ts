@@ -21,6 +21,7 @@ function createSerializableJob(overrides: Partial<SerializableJob> = {}): Serial
     insertedAt: now,
     scheduledAt: now,
     attemptedAt: now,
+    attemptedBy: null,
     completedAt: null,
     discardedAt: null,
     cancelledAt: null,
