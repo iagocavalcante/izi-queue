@@ -75,7 +75,7 @@
     "@types/jest": "^30.0.0",
     "@types/node": "^20.19.43",
     "@types/pg": "^8.20.4",
-    "better-sqlite3": "^12.11.1",
+    "better-sqlite3": "^13.0.0",
     "eslint": "^9.39.5",
     "globals": "^16.5.0",
     "jest": "^30.4.2",
