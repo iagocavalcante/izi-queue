@@ -76,21 +76,31 @@ jobs:
           IZI_TEST_MYSQL_URL: mysql://root:izi@localhost:3306/izi
 
   peer-range:
-    name: better-sqlite3 ${{ matrix.better-sqlite3 }}
+    name: better-sqlite3 ${{ matrix.better-sqlite3 }} on Node ${{ matrix.node }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         # Keeps the declared peerDependencies range honest. The dev dependency
-        # drifting past it is exactly how #50 shipped: every test ran against
-        # v12 while the package told users it needed ^9.
-        better-sqlite3: ['11', '12', '13']
+        # drifting past it is exactly how #50 shipped.
+        #
+        # Each driver is paired with the oldest Node it supports, because the
+        # two constraints interact: better-sqlite3 12 requires Node 20+ and 13
+        # requires Node 22+, so testing every driver on one modern Node hides
+        # the combinations a user on an older runtime would actually hit.
+        include:
+          - better-sqlite3: '11'
+            node: 18
+          - better-sqlite3: '12'
+            node: 20
+          - better-sqlite3: '13'
+            node: 22
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm install --no-save better-sqlite3@^${{ matrix.better-sqlite3 }}.0.0

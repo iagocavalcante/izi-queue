@@ -434,6 +434,11 @@ async perform(job) {
 
 Driver versions covered by the test suite: `better-sqlite3` 11-13, `pg` 8, `mysql2` 3.
 
+`better-sqlite3` and Node have interlocking floors, and the peer range cannot
+express that: **v12 requires Node 20+ and v13 requires Node 22+**. On Node 18,
+stay on `better-sqlite3` 11 — a newer driver installs but crashes the process
+with a segmentation fault rather than failing cleanly.
+
 ## Examples
 
 Check out the [examples](./examples) directory:
