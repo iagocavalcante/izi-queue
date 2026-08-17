@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below 1.0.0, breaking changes are released as minor versions.
 
+## [0.7.1] - 2026-08-17
+
+### Fixed
+
+- **`drain()` corrupted attempt counts and raced the poller.** It fetched jobs
+  (which marks them `executing` and consumes an attempt), forced them back to
+  `available`, kicked off an extra poll loop per pass, and could return while
+  jobs were still running -- so drained jobs reached `maxAttempts` early and
+  nothing was actually guaranteed drained. Modeled on `Oban.drain_queue/2`,
+  `drain()` now pauses the queue's poller, executes each job inline through the
+  same path the poller uses, and returns a `DrainResult` tally of
+  `success`/`failure`/`snoozed`/`discarded`/`cancelled` (previously the return
+  carried no information). Drained jobs also record `attemptedBy`, matching
+  poller-fetched jobs. ([#36])
+- **`pruneJobs` and `stageJobs` ran as single unbounded statements.** The first
+  prune after a long stretch of traffic was one `DELETE` over the whole
+  backlog -- a long, heavily-locking transaction -- and a large batch of jobs
+  all becoming due at once was one `UPDATE` blocking every concurrent fetch.
+  Both now work in bounded batches (default 5000 rows per statement), looping
+  until caught up and yielding to the event loop between batches, with the
+  MySQL batch query written to avoid `ERROR 1093`. Tune with
+  `PrunerConfig.batchSize` and `stageBatchSize` on `IziQueue`'s config. Custom
+  adapters implementing the previous `pruneJobs`/`stageJobs` signatures keep
+  working unchanged. ([#29])
+
 ## [0.7.0] - 2026-08-04
 
 ### Fixed
@@ -319,8 +344,11 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#45]: https://github.com/iagocavalcante/izi-queue/issues/45
 [#47]: https://github.com/iagocavalcante/izi-queue/pull/47
 [#50]: https://github.com/iagocavalcante/izi-queue/issues/50
+[#29]: https://github.com/iagocavalcante/izi-queue/issues/29
+[#36]: https://github.com/iagocavalcante/izi-queue/issues/36
 [0.4.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.3.0...v0.4.0
 [0.4.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.0...v0.4.1
 [0.5.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.1...v0.5.0
 [0.6.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.5.0...v0.6.0
 [0.7.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.6.0...v0.7.0
+[0.7.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.7.0...v0.7.1
