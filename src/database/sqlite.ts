@@ -1,5 +1,6 @@
 import type { Database } from 'better-sqlite3';
 import type {
+  BulkJobInsert,
   Job,
   JobCriteria,
   JobListCriteria,
@@ -13,8 +14,12 @@ import {
   BaseAdapter,
   DEFAULT_BATCH_SIZE,
   DEFAULT_NODE_TTL,
+  INSERT_JOB_COLUMNS,
   buildStateCounts,
+  chunkArray,
   criteriaClause,
+  groupBulkRuns,
+  maxRowsPerStatement,
   orderByClause,
   resolveListLimit,
   resolveListOffset,
@@ -22,6 +27,17 @@ import {
 } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 import { sqliteMigrations } from './migrations.js';
+
+/**
+ * SQLite's `SQLITE_MAX_VARIABLE_NUMBER` has defaulted to 32766 since 3.32.0
+ * (2020). better-sqlite3's supported peer range (^9 - ^13) all bundle SQLite
+ * releases well past that, so 32766 is safe for every version this adapter
+ * supports. `insertJobs` chunks its multi-row INSERTs to stay under it:
+ * floor(32766 / 12 columns) = 2730 rows per statement. A build recompiled
+ * with a lower compile-time limit is responsible for its own chunking.
+ */
+const SQLITE_MAX_BIND_PARAMS = 32766;
+export const INSERT_JOBS_CHUNK_SIZE = maxRowsPerStatement(SQLITE_MAX_BIND_PARAMS);
 
 export class SQLiteAdapter extends BaseAdapter {
   private db: Database;
@@ -411,6 +427,85 @@ export class SQLiteAdapter extends BaseAdapter {
       .prepare('SELECT * FROM izi_jobs WHERE id = ?')
       .get(result.lastInsertRowid) as Record<string, unknown>;
     return rowToJob(row);
+  }
+
+  /** One multi-row `INSERT ... RETURNING *`, sized to stay under the bind-variable cap. */
+  private insertPlainChunk(batch: Omit<Job, 'id' | 'insertedAt'>[]): Job[] {
+    const rowPlaceholder = `(${Array(INSERT_JOB_COLUMNS).fill('?').join(', ')})`;
+    const stmt = this.db.prepare(`
+      INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at, unique_key)
+      VALUES ${batch.map(() => rowPlaceholder).join(', ')}
+      RETURNING *
+    `);
+
+    const params: unknown[] = [];
+    for (const job of batch) {
+      params.push(
+        job.state,
+        job.queue,
+        job.worker,
+        JSON.stringify(job.args),
+        JSON.stringify(job.meta),
+        JSON.stringify(job.tags),
+        JSON.stringify(job.errors),
+        job.attempt,
+        job.maxAttempts,
+        job.priority,
+        job.scheduledAt.toISOString(),
+        job.uniqueKey ?? null
+      );
+    }
+
+    const rows = stmt.all(...params) as Record<string, unknown>[];
+    return rows.map(rowToJob);
+  }
+
+  async insertJobs(
+    jobs: BulkJobInsert[],
+    tx?: TransactionHandle
+  ): Promise<{ job: Job; conflict: boolean }[]> {
+    this.resolveTx(tx);
+    if (jobs.length === 0) return [];
+
+    const runs = groupBulkRuns(jobs);
+
+    const runAll = (): { job: Job; conflict: boolean }[] => {
+      const out: { job: Job; conflict: boolean }[] = [];
+
+      for (const run of runs) {
+        if (run.kind === 'plain') {
+          for (const batch of chunkArray(run.jobs, INSERT_JOBS_CHUNK_SIZE)) {
+            out.push(...this.insertPlainChunk(batch).map(job => ({ job, conflict: false })));
+          }
+          continue;
+        }
+
+        const { states, period } = this.uniqueLookup(run.unique);
+        const uniqueKey = run.job.uniqueKey ?? computeUniqueKey(run.job, run.unique);
+        const existing = this.findUnique(uniqueKey, states, period);
+
+        if (existing) {
+          out.push({ job: existing, conflict: true });
+        } else {
+          out.push({ job: this.insertJobSync({ ...run.job, uniqueKey }), conflict: false });
+        }
+      }
+
+      return out;
+    };
+
+    // Already inside the caller's transaction (or better-sqlite3's single
+    // connection has one open) -- opening another would fail, and it is what
+    // makes each unique check-and-insert atomic against the rest of the batch.
+    if (tx !== undefined || this.db.inTransaction) {
+      return runAll();
+    }
+
+    // `immediate` takes the write lock up front. A deferred transaction would
+    // start as a reader and only try to upgrade at the first INSERT, which
+    // SQLite refuses outright rather than waiting when another writer got
+    // there first.
+    return this.db.transaction(runAll).immediate();
   }
 
   async close(): Promise<void> {

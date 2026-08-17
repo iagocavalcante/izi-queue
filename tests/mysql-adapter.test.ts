@@ -1,6 +1,6 @@
 import mysql from 'mysql2/promise';
-import { createMySQLAdapter, MySQLAdapter } from '../src/database/mysql.js';
-import type { Job } from '../src/types.js';
+import { createMySQLAdapter, MySQLAdapter, INSERT_JOBS_CHUNK_SIZE } from '../src/database/mysql.js';
+import type { BulkJobInsert, Job } from '../src/types.js';
 
 /**
  * These tests need a real MySQL server (8.0.1+ for FOR UPDATE SKIP LOCKED).
@@ -421,6 +421,144 @@ describeMySQL('MySQLAdapter', () => {
       const second = await adapter.insertUnique(jobData({ args: { userId: 1 } }), unique);
 
       expect(second.conflict).toBe(false);
+    });
+  });
+
+  describe('insertJobs', () => {
+    it('returns an empty array for an empty batch', async () => {
+      expect(await adapter.insertJobs([])).toEqual([]);
+    });
+
+    it('inserts every job in one call, in order', async () => {
+      const entries: BulkJobInsert[] = [
+        { job: jobData({ args: { id: 1 } }) },
+        { job: jobData({ args: { id: 2 } }) },
+        { job: jobData({ args: { id: 3 } }) },
+      ];
+
+      const results = await adapter.insertJobs(entries);
+
+      expect(results.map((r) => r.conflict)).toEqual([false, false, false]);
+      expect(results.map((r) => (r.job.args as { id: number }).id)).toEqual([1, 2, 3]);
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(3);
+    });
+
+    it('round-trips a batch spanning multiple chunks, recovering ids by range', async () => {
+      // One row past two full chunks, to prove the chunk boundary itself does
+      // not drop or misorder a row, and that the id-range recovery lines up
+      // with the VALUES order across statements.
+      const total = INSERT_JOBS_CHUNK_SIZE * 2 + 1;
+      const entries: BulkJobInsert[] = Array.from({ length: total }, (_, i) => ({
+        job: jobData({ args: { i } }),
+      }));
+
+      const results = await adapter.insertJobs(entries);
+
+      expect(results).toHaveLength(total);
+      expect(results.map((r) => (r.job.args as { i: number }).i)).toEqual(
+        Array.from({ length: total }, (_, i) => i)
+      );
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(total);
+    }, 60000);
+
+    it('checks a unique entry against a pre-existing row and reports a conflict', async () => {
+      const existing = await adapter.insertUnique(
+        jobData({ worker: 'UniqueWorker', args: { userId: 1 } }),
+        { period: 60 }
+      );
+
+      const results = await adapter.insertJobs([
+        { job: jobData({ args: { plain: true } }) },
+        { job: jobData({ worker: 'UniqueWorker', args: { userId: 1 } }), unique: { period: 60 } },
+      ]);
+
+      expect(results[0].conflict).toBe(false);
+      expect(results[1].conflict).toBe(true);
+      expect(results[1].job.id).toBe(existing.job.id);
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(2);
+    });
+
+    it('does not conflate distinct unique entries inserted in the same batch', async () => {
+      const results = await adapter.insertJobs([
+        { job: jobData({ worker: 'UniqueWorker', args: { userId: 1 } }), unique: { period: 60 } },
+        { job: jobData({ worker: 'UniqueWorker', args: { userId: 2 } }), unique: { period: 60 } },
+      ]);
+
+      expect(results.every((r) => !r.conflict)).toBe(true);
+      expect(results[0].job.id).not.toBe(results[1].job.id);
+    });
+
+    it('rolls back the whole batch when a later statement fails', async () => {
+      const entries: BulkJobInsert[] = [
+        { job: jobData({ args: { id: 1 } }) },
+        { job: jobData({ worker: 'UniqueWorker', args: { userId: 1 } }), unique: { period: 60 } },
+        // A circular reference cannot be JSON.stringify'd, so this fails
+        // while the third statement is being built -- after the first two
+        // have already been written inside the (uncommitted) transaction.
+        { job: jobData({ args: (() => { const a: Record<string, unknown> = {}; a.self = a; return a; })() }) },
+      ];
+
+      await expect(adapter.insertJobs(entries)).rejects.toThrow();
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(0);
+    });
+
+    it('commits together with the caller-supplied transaction (no unique entries)', async () => {
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const results = await adapter.insertJobs(
+          [{ job: jobData({ args: { id: 1 } }) }, { job: jobData({ args: { id: 2 } }) }],
+          conn
+        );
+        expect(results).toHaveLength(2);
+        await conn.commit();
+      } finally {
+        conn.release();
+      }
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(2);
+    });
+
+    it('rolls back together with the caller-supplied transaction (no unique entries)', async () => {
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await adapter.insertJobs(
+          [{ job: jobData({ args: { id: 1 } }) }, { job: jobData({ args: { id: 2 } }) }],
+          conn
+        );
+        await conn.rollback();
+      } finally {
+        conn.release();
+      }
+
+      const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
+      expect(Number(rows[0].c)).toBe(0);
+    });
+
+    it('refuses a batch with a unique entry inside a caller transaction', async () => {
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        await expect(
+          adapter.insertJobs(
+            [{ job: jobData({ args: { userId: 1 } }), unique: { period: 60 } }],
+            conn
+          )
+        ).rejects.toThrow(/unique/i);
+        await conn.rollback();
+      } finally {
+        conn.release();
+      }
     });
   });
 

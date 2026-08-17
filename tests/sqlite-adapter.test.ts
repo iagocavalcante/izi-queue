@@ -1,6 +1,6 @@
 import Database from 'better-sqlite3';
-import { createSQLiteAdapter } from '../src/database/sqlite.js';
-import type { Job, JobState, UniqueOptions } from '../src/types.js';
+import { createSQLiteAdapter, INSERT_JOBS_CHUNK_SIZE } from '../src/database/sqlite.js';
+import type { BulkJobInsert, Job, JobState, UniqueOptions } from '../src/types.js';
 
 describe('SQLiteAdapter', () => {
   let db: Database.Database;
@@ -802,6 +802,110 @@ describe('SQLiteAdapter', () => {
 
       expect(result.conflict).toBe(false);
       expect(((await adapter.getJob(result.job.id))?.args as { blob: string }).blob).toHaveLength(20000);
+    });
+  });
+
+  describe('insertJobs', () => {
+    it('returns an empty array for an empty batch', async () => {
+      expect(await adapter.insertJobs([])).toEqual([]);
+    });
+
+    it('inserts every job in one call, in order', async () => {
+      const entries: BulkJobInsert[] = [
+        { job: createJobData({ args: { id: 1 } }) },
+        { job: createJobData({ args: { id: 2 } }) },
+        { job: createJobData({ args: { id: 3 } }) }
+      ];
+
+      const results = await adapter.insertJobs(entries);
+
+      expect(results.map(r => r.conflict)).toEqual([false, false, false]);
+      expect(results.map(r => (r.job.args as { id: number }).id)).toEqual([1, 2, 3]);
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(3);
+    });
+
+    it('round-trips a batch spanning multiple chunks', async () => {
+      // One row past two full chunks, to prove the chunk boundary itself
+      // does not drop or misorder a row.
+      const total = INSERT_JOBS_CHUNK_SIZE * 2 + 1;
+      const entries: BulkJobInsert[] = Array.from({ length: total }, (_, i) => ({
+        job: createJobData({ args: { i } })
+      }));
+
+      const results = await adapter.insertJobs(entries);
+
+      expect(results).toHaveLength(total);
+      expect(results.map(r => (r.job.args as { i: number }).i)).toEqual(
+        Array.from({ length: total }, (_, i) => i)
+      );
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(total);
+    }, 30000);
+
+    it('checks a unique entry against a pre-existing row and reports a conflict', async () => {
+      const existing = await adapter.insertUnique(
+        createJobData({ worker: 'UniqueWorker', args: { userId: 1 } }),
+        { period: 60 }
+      );
+
+      const results = await adapter.insertJobs([
+        { job: createJobData({ args: { plain: true } }) },
+        {
+          job: createJobData({ worker: 'UniqueWorker', args: { userId: 1 } }),
+          unique: { period: 60 }
+        }
+      ]);
+
+      expect(results[0].conflict).toBe(false);
+      expect(results[1].conflict).toBe(true);
+      expect(results[1].job.id).toBe(existing.job.id);
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(2);
+    });
+
+    it('rolls back the whole batch when a later statement fails', async () => {
+      const entries: BulkJobInsert[] = [
+        { job: createJobData({ args: { id: 1 } }) },
+        { job: createJobData({ worker: 'UniqueWorker', args: { userId: 1 } }), unique: { period: 60 } },
+        // JSON.stringify throws on a BigInt, so this fails while the third
+        // statement is being built -- after the first two already wrote to
+        // the (uncommitted) transaction.
+        { job: createJobData({ args: { bad: 10n } }) }
+      ];
+
+      await expect(adapter.insertJobs(entries)).rejects.toThrow();
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(0);
+    });
+
+    it('commits together with the caller-supplied transaction', async () => {
+      db.exec('BEGIN');
+      const results = await adapter.insertJobs(
+        [{ job: createJobData({ args: { id: 1 } }) }, { job: createJobData({ args: { id: 2 } }) }],
+        db
+      );
+      db.exec('COMMIT');
+
+      expect(results).toHaveLength(2);
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(2);
+    });
+
+    it('rolls back together with the caller-supplied transaction', async () => {
+      db.exec('BEGIN');
+      await adapter.insertJobs(
+        [{ job: createJobData({ args: { id: 1 } }) }, { job: createJobData({ args: { id: 2 } }) }],
+        db
+      );
+      db.exec('ROLLBACK');
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(0);
     });
   });
 

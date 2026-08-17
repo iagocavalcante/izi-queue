@@ -1,8 +1,8 @@
 import pg from 'pg';
 import { randomBytes } from 'crypto';
 import { waitFor } from './helpers/wait.js';
-import { createPostgresAdapter, PostgresAdapter } from '../src/database/postgres.js';
-import type { Job, Logger } from '../src/types.js';
+import { createPostgresAdapter, PostgresAdapter, INSERT_JOBS_CHUNK_SIZE } from '../src/database/postgres.js';
+import type { BulkJobInsert, Job, Logger } from '../src/types.js';
 
 /**
  * These tests need a real PostgreSQL server; the dialect differences that matter
@@ -404,6 +404,130 @@ describePostgres('PostgresAdapter', () => {
       const job = await adapter.insertJob(jobData({ args: { blob } }));
 
       expect(job.id).toBeGreaterThan(0);
+    });
+  });
+
+  describe('insertJobs', () => {
+    it('returns an empty array for an empty batch', async () => {
+      expect(await adapter.insertJobs([])).toEqual([]);
+    });
+
+    it('inserts every job in one call, in order', async () => {
+      const entries: BulkJobInsert[] = [
+        { job: jobData({ args: { id: 1 } }) },
+        { job: jobData({ args: { id: 2 } }) },
+        { job: jobData({ args: { id: 3 } }) },
+      ];
+
+      const results = await adapter.insertJobs(entries);
+
+      expect(results.map((r) => r.conflict)).toEqual([false, false, false]);
+      expect(results.map((r) => (r.job.args as { id: number }).id)).toEqual([1, 2, 3]);
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(3);
+    });
+
+    it('round-trips a batch spanning multiple chunks', async () => {
+      // One row past two full chunks, to prove the chunk boundary itself
+      // does not drop or misorder a row.
+      const total = INSERT_JOBS_CHUNK_SIZE * 2 + 1;
+      const entries: BulkJobInsert[] = Array.from({ length: total }, (_, i) => ({
+        job: jobData({ args: { i } }),
+      }));
+
+      const results = await adapter.insertJobs(entries);
+
+      expect(results).toHaveLength(total);
+      expect(results.map((r) => (r.job.args as { i: number }).i)).toEqual(
+        Array.from({ length: total }, (_, i) => i)
+      );
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(total);
+    }, 60000);
+
+    it('checks a unique entry against a pre-existing row and reports a conflict', async () => {
+      const existing = await adapter.insertUnique(
+        jobData({ worker: 'UniqueWorker', args: { userId: 1 } }),
+        { period: 60 }
+      );
+
+      const results = await adapter.insertJobs([
+        { job: jobData({ args: { plain: true } }) },
+        { job: jobData({ worker: 'UniqueWorker', args: { userId: 1 } }), unique: { period: 60 } },
+      ]);
+
+      expect(results[0].conflict).toBe(false);
+      expect(results[1].conflict).toBe(true);
+      expect(results[1].job.id).toBe(existing.job.id);
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(2);
+    });
+
+    it('does not conflate distinct unique entries inserted in the same batch', async () => {
+      const results = await adapter.insertJobs([
+        { job: jobData({ worker: 'UniqueWorker', args: { userId: 1 } }), unique: { period: 60 } },
+        { job: jobData({ worker: 'UniqueWorker', args: { userId: 2 } }), unique: { period: 60 } },
+      ]);
+
+      expect(results.every((r) => !r.conflict)).toBe(true);
+      expect(results[0].job.id).not.toBe(results[1].job.id);
+    });
+
+    it('rolls back the whole batch when a later statement fails', async () => {
+      const entries: BulkJobInsert[] = [
+        { job: jobData({ args: { id: 1 } }) },
+        { job: jobData({ worker: 'UniqueWorker', args: { userId: 1 } }), unique: { period: 60 } },
+        // A circular reference cannot be JSON.stringify'd, so this fails
+        // while the third statement is being built -- after the first two
+        // have already been written inside the (uncommitted) transaction.
+        { job: jobData({ args: (() => { const a: Record<string, unknown> = {}; a.self = a; return a; })() }) },
+      ];
+
+      await expect(adapter.insertJobs(entries)).rejects.toThrow();
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(0);
+    });
+
+    it('commits together with the caller-supplied transaction, including a unique entry', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const results = await adapter.insertJobs(
+          [
+            { job: jobData({ args: { id: 1 } }) },
+            { job: jobData({ worker: 'UniqueWorker', args: { userId: 1 } }), unique: { period: 60 } },
+          ],
+          client
+        );
+        expect(results).toHaveLength(2);
+        await client.query('COMMIT');
+      } finally {
+        client.release();
+      }
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(2);
+    });
+
+    it('rolls back together with the caller-supplied transaction', async () => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await adapter.insertJobs(
+          [{ job: jobData({ args: { id: 1 } }) }, { job: jobData({ args: { id: 2 } }) }],
+          client
+        );
+        await client.query('ROLLBACK');
+      } finally {
+        client.release();
+      }
+
+      const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM izi_jobs');
+      expect(rows[0].count).toBe(0);
     });
   });
 

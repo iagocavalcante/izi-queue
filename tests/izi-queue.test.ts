@@ -372,6 +372,208 @@ describe('IziQueue Class', () => {
 
       await queue.shutdown();
     });
+
+    it('preserves input order across a mix of queues', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5, priority: 5 }
+      });
+
+      const jobs = await queue.insertAll('BatchWorker', [
+        { args: { id: 1 }, queue: 'priority' },
+        { args: { id: 2 } },
+        { args: { id: 3 }, queue: 'priority' }
+      ]);
+
+      expect(jobs.map(j => j.args)).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+      expect(jobs.map(j => j.queue)).toEqual(['priority', 'default', 'priority']);
+
+      await queue.shutdown();
+    });
+
+    it('collapses duplicate unique jobs within the batch before hitting the database', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      const results = await queue.insertAllWithResult('BatchWorker', [
+        { args: { userId: 1 }, unique: { period: 60 } },
+        { args: { userId: 1 }, unique: { period: 60 } },
+        { args: { userId: 2 }, unique: { period: 60 } }
+      ]);
+
+      expect(results[0].conflict).toBe(false);
+      expect(results[1].conflict).toBe(true);
+      expect(results[1].job.id).toBe(results[0].job.id);
+      expect(results[2].conflict).toBe(false);
+      expect(results[2].job.id).not.toBe(results[0].job.id);
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(2);
+
+      await queue.shutdown();
+    });
+
+    it('reports a conflict with a pre-existing job the same way a single insert does', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      const existing = await queue.insert('BatchWorker', {
+        args: { userId: 1 },
+        unique: { period: 60 }
+      });
+
+      const results = await queue.insertAllWithResult('BatchWorker', [
+        { args: { userId: 99 } },
+        { args: { userId: 1 }, unique: { period: 60 } }
+      ]);
+
+      expect(results[0].conflict).toBe(false);
+      expect(results[1].conflict).toBe(true);
+      expect(results[1].job.id).toBe(existing.id);
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(2);
+
+      await queue.shutdown();
+    });
+
+    it('rolls back the whole batch when one row fails', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      await expect(
+        queue.insertAll('BatchWorker', [
+          { args: { id: 1 } },
+          // A unique job breaks the otherwise-contiguous run of plain jobs
+          // into separate statements, so the batch spans more than one SQL
+          // statement inside its transaction rather than failing atomically
+          // as a single multi-row INSERT.
+          { args: { id: 2 }, unique: { period: 60 } },
+          // A BigInt cannot be JSON.stringify'd, so this throws while
+          // building the third statement -- after the first two have already
+          // been written inside the (uncommitted) transaction.
+          { args: { bad: 10n } }
+        ])
+      ).rejects.toThrow();
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(0);
+
+      await queue.shutdown();
+    });
+
+    it('sends at most one wake-up notification per queue in the batch', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5, priority: 5 }
+      });
+      await queue.start();
+
+      const notify = jest.fn(async (_queue: string, _tx?: unknown) => {});
+      // SQLiteAdapter has no built-in notify (it relies on polling); attach a
+      // stub since `notify` is an optional part of the adapter interface, and
+      // this is the only way to count wake-ups precisely.
+      (adapter as unknown as { notify: typeof notify }).notify = notify;
+
+      await queue.insertAll('BatchWorker', [
+        { args: { id: 1 } },
+        { args: { id: 2 }, queue: 'priority' },
+        { args: { id: 3 } },
+        { args: { id: 4 }, queue: 'priority' }
+      ]);
+
+      expect(notify).toHaveBeenCalledTimes(2);
+      expect(notify.mock.calls.map(call => call[0]).sort()).toEqual(['default', 'priority']);
+
+      await queue.shutdown();
+    });
+
+    it('does not wake a queue whose only batch entries were conflicts', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+      await queue.start();
+
+      await queue.insert('BatchWorker', { args: { userId: 1 }, unique: { period: 60 } });
+
+      const notify = jest.fn(async (_queue: string, _tx?: unknown) => {});
+      (adapter as unknown as { notify: typeof notify }).notify = notify;
+
+      await queue.insertAll('BatchWorker', [
+        { args: { userId: 1 }, unique: { period: 60 } }
+      ]);
+
+      expect(notify).not.toHaveBeenCalled();
+
+      await queue.shutdown();
+    });
+
+    it('rejects a batch whose entries disagree on which transaction to use', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      const otherDb = new (await import('better-sqlite3')).default(':memory:');
+      try {
+        await expect(
+          queue.insertAll('BatchWorker', [
+            { args: { id: 1 }, tx: db },
+            { args: { id: 2 }, tx: otherDb }
+          ])
+        ).rejects.toThrow(/same transaction handle/i);
+      } finally {
+        otherDb.close();
+      }
+
+      await queue.shutdown();
+    });
+
+    it('rejects a batch where only some entries carry a transaction', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      await expect(
+        queue.insertAll('BatchWorker', [
+          { args: { id: 1 }, tx: db },
+          { args: { id: 2 } }
+        ])
+      ).rejects.toThrow(/same transaction handle/i);
+
+      await queue.shutdown();
+    });
+
+    it('rolls back with the caller-supplied transaction', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      db.exec('BEGIN');
+      try {
+        await queue.insertAll('BatchWorker', [
+          { args: { id: 1 }, tx: db },
+          { args: { id: 2 }, tx: db }
+        ]);
+        throw new Error('business logic failed');
+      } catch {
+        db.exec('ROLLBACK');
+      }
+
+      const count = (db.prepare('SELECT COUNT(*) AS c FROM izi_jobs').get() as { c: number }).c;
+      expect(count).toBe(0);
+
+      await queue.shutdown();
+    });
   });
 
   describe('getJob', () => {
