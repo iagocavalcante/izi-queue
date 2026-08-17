@@ -1,6 +1,25 @@
 import type { Database } from 'better-sqlite3';
-import type { Job, JobCriteria, JobState, Logger, TransactionHandle, UniqueOptions } from '../types.js';
-import { BaseAdapter, DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, criteriaClause, rowToJob } from './adapter.js';
+import type {
+  Job,
+  JobCriteria,
+  JobListCriteria,
+  JobState,
+  JobStateCounts,
+  Logger,
+  TransactionHandle,
+  UniqueOptions
+} from '../types.js';
+import {
+  BaseAdapter,
+  DEFAULT_BATCH_SIZE,
+  DEFAULT_NODE_TTL,
+  buildStateCounts,
+  criteriaClause,
+  orderByClause,
+  resolveListLimit,
+  resolveListOffset,
+  rowToJob
+} from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 import { sqliteMigrations } from './migrations.js';
 
@@ -232,7 +251,7 @@ export class SQLiteAdapter extends BaseAdapter {
   }
 
   async cancelJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, () => '?');
+    const { clause, params } = criteriaClause(criteria, () => '?', 'sqlite');
     const stmt = this.db.prepare(`
       UPDATE izi_jobs
       SET state = 'cancelled', cancelled_at = datetime('now')
@@ -242,7 +261,7 @@ export class SQLiteAdapter extends BaseAdapter {
   }
 
   async retryJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, () => '?');
+    const { clause, params } = criteriaClause(criteria, () => '?', 'sqlite');
     // Raising max_attempts matters for jobs that were discarded after
     // exhausting them: without headroom the job would be discarded again on
     // its very next fetch.
@@ -256,6 +275,24 @@ export class SQLiteAdapter extends BaseAdapter {
       WHERE state IN ('discarded', 'cancelled')${clause}
     `);
     return stmt.run(...params).changes;
+  }
+
+  async listJobs(criteria: JobListCriteria = {}): Promise<Job[]> {
+    const { clause, params } = criteriaClause(criteria, () => '?', 'sqlite');
+    const limit = resolveListLimit(criteria.limit);
+    const offset = resolveListOffset(criteria.offset);
+    const order = orderByClause(criteria.orderBy);
+
+    const stmt = this.db.prepare(`SELECT * FROM izi_jobs WHERE 1=1${clause} ${order} LIMIT ? OFFSET ?`);
+    const rows = stmt.all(...params, limit, offset) as Record<string, unknown>[];
+    return rows.map(rowToJob);
+  }
+
+  async countJobs(criteria: JobCriteria = {}): Promise<JobStateCounts> {
+    const { clause, params } = criteriaClause(criteria, () => '?', 'sqlite');
+    const stmt = this.db.prepare(`SELECT state, COUNT(*) AS count FROM izi_jobs WHERE 1=1${clause} GROUP BY state`);
+    const rows = stmt.all(...params) as { state: string; count: number }[];
+    return buildStateCounts(rows);
   }
 
   async rescueStuckJobs(rescueAfter: number, nodeTtl = DEFAULT_NODE_TTL): Promise<number> {

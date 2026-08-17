@@ -48,6 +48,12 @@ export {
   createMySQLAdapter
 } from './database/index.js';
 
+export {
+  DEFAULT_LIST_LIMIT,
+  MAX_LIST_LIMIT,
+  JOB_STATES
+} from './database/adapter.js';
+
 // Plugins
 export {
   BasePlugin,
@@ -68,6 +74,11 @@ export type {
   JobState,
   JobError,
   JobInsertOptions,
+  JobCriteria,
+  JobListCriteria,
+  JobOrderBy,
+  JobOrderByField,
+  JobStateCounts,
   UniqueOptions,
   WorkerResult,
   WorkerDefinition,

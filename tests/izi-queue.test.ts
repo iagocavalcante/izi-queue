@@ -9,7 +9,24 @@ import {
   clearWorkers
 } from '../src/index.js';
 import { waitForEvent } from './helpers/wait.js';
-import type { Job, Logger } from '../src/types.js';
+import type { DatabaseAdapter, Job, Logger } from '../src/types.js';
+
+/**
+ * A class instance's methods live on its prototype, not as own properties, so
+ * `{ ...adapter, listJobs: undefined }` would silently drop every other
+ * method too. This proxy keeps every method delegating to `adapter` except
+ * the one under test, which is what actually simulates "an adapter that
+ * doesn't implement this optional method".
+ */
+function adapterWithout(adapter: DatabaseAdapter, methodName: 'listJobs' | 'countJobs'): DatabaseAdapter {
+  return new Proxy(adapter, {
+    get(target, prop, receiver) {
+      if (prop === methodName) return undefined;
+      const value = Reflect.get(target, prop, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+}
 
 describe('IziQueue Class', () => {
   let db: Database.Database;
@@ -386,6 +403,78 @@ describe('IziQueue Class', () => {
     });
   });
 
+  describe('listJobs', () => {
+    it('delegates to the adapter and returns matching jobs', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      await queue.insert('WorkerA', { args: {} });
+      await queue.insert('WorkerB', { args: {} });
+
+      const jobs = await queue.listJobs({ worker: 'WorkerA' });
+
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].worker).toBe('WorkerA');
+
+      await queue.shutdown();
+    });
+
+    it('does not require scoping -- unlike cancelJobs/retryJobs it is read-only', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      await queue.insert('Worker', { args: {} });
+
+      await expect(queue.listJobs({})).resolves.toHaveLength(1);
+
+      await queue.shutdown();
+    });
+
+    it('throws a clear error when the adapter does not implement listJobs', async () => {
+      const queue = createIziQueue({
+        database: adapterWithout(adapter, 'listJobs'),
+        queues: { default: 5 }
+      });
+
+      await expect(queue.listJobs({})).rejects.toThrow(/does not support listJobs/);
+
+      await queue.shutdown();
+    });
+  });
+
+  describe('countJobs', () => {
+    it('delegates to the adapter and returns counts grouped by state', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      await queue.insert('Worker', { args: {} });
+
+      const counts = await queue.countJobs({});
+
+      expect(counts.available).toBe(1);
+      expect(counts.completed).toBe(0);
+
+      await queue.shutdown();
+    });
+
+    it('throws a clear error when the adapter does not implement countJobs', async () => {
+      const queue = createIziQueue({
+        database: adapterWithout(adapter, 'countJobs'),
+        queues: { default: 5 }
+      });
+
+      await expect(queue.countJobs({})).rejects.toThrow(/does not support countJobs/);
+
+      await queue.shutdown();
+    });
+  });
+
   describe('cancelJobs', () => {
     it('should cancel jobs by worker name', async () => {
       const queue = createIziQueue({
@@ -433,6 +522,33 @@ describe('IziQueue Class', () => {
       const cancelled = await queue.cancelJobs({ state: ['available'] });
 
       expect(cancelled).toBe(1);
+
+      await queue.shutdown();
+    });
+
+    it('accepts tags alone as a valid scope, without needing { all: true }', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      await queue.insert('Worker', { args: {}, tags: ['billing'] });
+      await queue.insert('Worker', { args: {}, tags: ['other'] });
+
+      const cancelled = await queue.cancelJobs({ tags: ['billing'] });
+
+      expect(cancelled).toBe(1);
+
+      await queue.shutdown();
+    });
+
+    it('still rejects a completely unscoped call', async () => {
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      await expect(queue.cancelJobs({})).rejects.toThrow(/requires at least one criterion/);
 
       await queue.shutdown();
     });
