@@ -1,4 +1,5 @@
 import type {
+  BulkJobInsert,
   DatabaseAdapter,
   DrainResult,
   IziQueueConfig,
@@ -335,7 +336,181 @@ export class IziQueue {
     worker: string | WorkerDefinition<T>,
     jobs: JobInsertOptions<T>[]
   ): Promise<Job<T>[]> {
-    return Promise.all(jobs.map(options => this.insert(worker, options)));
+    const results = await this.insertAllWithResult(worker, jobs);
+    return results.map(result => result.job);
+  }
+
+  /**
+   * Bulk-inserts every job in `jobs` in one transaction and as few round
+   * trips as the database's parameter limits allow (chunked only to stay
+   * under them), modeled on `Oban.insert_all/2`. A failure partway through
+   * rolls back the whole batch rather than leaving it half-applied -- unlike
+   * calling `insert` once per job, which is what this used to do.
+   *
+   * Jobs sharing a unique key within the same call are deduplicated before
+   * anything reaches the database: only the first occurrence is a candidate
+   * for insertion. Every later occurrence, and every job that conflicts with
+   * a pre-existing row, comes back the way a single conflicting `insert`
+   * does -- `conflict: true` and the job that already exists (or that already
+   * won the batch) -- rather than inserting a duplicate.
+   *
+   * At most one wake-up notification is sent per distinct queue represented
+   * in the batch, regardless of how many jobs landed in it.
+   *
+   * Each entry may carry its own `tx`, the same as a single `insert`, but
+   * since the whole batch commits or rolls back together there can only be
+   * one transaction: every entry that sets `tx` must set the *same* handle,
+   * or the call is rejected.
+   */
+  async insertAllWithResult<T = Record<string, unknown>>(
+    worker: string | WorkerDefinition<T>,
+    jobs: JobInsertOptions<T>[]
+  ): Promise<InsertResult<T>[]> {
+    if (jobs.length === 0) return [];
+
+    const tx = this.resolveBatchTx(jobs);
+
+    const workerName = typeof worker === 'string' ? worker : worker.name;
+    const workerDef = getWorker(workerName);
+
+    const jobDatas = jobs.map(options =>
+      createJob(workerName, {
+        ...options,
+        queue: options.queue ?? workerDef?.queue ?? 'default',
+        maxAttempts: options.maxAttempts ?? workerDef?.maxAttempts ?? 20,
+        priority: options.priority ?? workerDef?.priority ?? 0
+      })
+    );
+
+    // Collapse in-batch duplicates: entries sharing a unique key resolve to
+    // whichever occurrence came first. Everything after it is skipped here
+    // and treated exactly like a conflict with a pre-existing row once the
+    // first occurrence's outcome is known.
+    const primaryOf: number[] = jobDatas.map((_, i) => i);
+    const seenKeys = new Map<string, number>();
+    const bulkEntries: Array<BulkJobInsert & { index: number }> = [];
+
+    jobDatas.forEach((data, i) => {
+      const unique = jobs[i].unique;
+      if (!unique) {
+        bulkEntries.push({ index: i, job: data as Omit<Job, 'id' | 'insertedAt'> });
+        return;
+      }
+
+      const uniqueKey = computeUniqueKey(data, unique);
+      const seenAt = seenKeys.get(uniqueKey);
+      if (seenAt !== undefined) {
+        primaryOf[i] = seenAt;
+        return;
+      }
+
+      seenKeys.set(uniqueKey, i);
+      bulkEntries.push({
+        index: i,
+        job: { ...data, uniqueKey } as Omit<Job, 'id' | 'insertedAt'>,
+        unique
+      });
+    });
+
+    const inserted = this.config.database.insertJobs
+      ? await this.config.database.insertJobs(
+          bulkEntries.map(({ job, unique }) => ({ job, unique })),
+          tx
+        )
+      : await this.insertJobsUnsafely(bulkEntries, tx);
+
+    const byIndex = new Map<number, { job: Job; conflict: boolean }>();
+    bulkEntries.forEach((entry, i) => byIndex.set(entry.index, inserted[i]));
+
+    const results: InsertResult<T>[] = jobDatas.map((_, i) => {
+      const direct = byIndex.get(i);
+      if (direct) {
+        return { job: direct.job as Job<T>, conflict: direct.conflict };
+      }
+
+      // In-batch duplicate: always resolves to its primary's job, and is
+      // always reported as a conflict -- it did not create a new row.
+      const primary = byIndex.get(primaryOf[i])!;
+      return { job: primary.job as Job<T>, conflict: true };
+    });
+
+    for (const result of results) {
+      if (result.conflict) {
+        telemetry.emit('job:unique_conflict', { job: result.job as Job, queue: result.job.queue });
+      }
+    }
+
+    const queuesToWake = new Set(results.filter(r => !r.conflict).map(r => r.job.queue));
+    for (const queue of queuesToWake) {
+      await this.wake(queue, tx);
+    }
+
+    return results;
+  }
+
+  /**
+   * Every entry in an `insertAll` batch shares one transaction, since the
+   * batch commits or rolls back as a unit. An entry that sets `tx` must set
+   * the same handle as every other entry that does; mixing handles, or
+   * setting one only on some entries, is rejected rather than silently
+   * picking one and ignoring the rest.
+   */
+  private resolveBatchTx<T>(jobs: JobInsertOptions<T>[]): TransactionHandle | undefined {
+    let tx: TransactionHandle | undefined;
+    let entriesWithTx = 0;
+
+    for (const options of jobs) {
+      if (options.tx === undefined) continue;
+
+      if (entriesWithTx === 0) {
+        tx = options.tx;
+      } else if (options.tx !== tx) {
+        throw new Error(
+          'izi-queue: insertAll requires every entry to share the same transaction handle ' +
+            '(or none at all), since the whole batch commits or rolls back together.'
+        );
+      }
+      entriesWithTx++;
+    }
+
+    // An entry without tx in a batch that has one would silently ride along
+    // in the caller's transaction -- and vanish with its rollback -- despite
+    // the caller never attaching it. All-or-none keeps that explicit.
+    if (entriesWithTx > 0 && entriesWithTx !== jobs.length) {
+      throw new Error(
+        'izi-queue: insertAll requires every entry to share the same transaction handle ' +
+          '(or none at all), since the whole batch commits or rolls back together.'
+      );
+    }
+
+    return tx;
+  }
+
+  /**
+   * Fallback for adapters predating `insertJobs`. Each row is a separate
+   * round trip and the batch is not atomic -- a failure partway through
+   * leaves earlier rows committed. This is exactly `insertAll`'s pre-#32
+   * behavior, kept only so a third-party adapter that has not added bulk
+   * support yet still works.
+   */
+  private async insertJobsUnsafely(
+    entries: Array<BulkJobInsert & { index: number }>,
+    tx?: TransactionHandle
+  ): Promise<{ job: Job; conflict: boolean }[]> {
+    const results: { job: Job; conflict: boolean }[] = [];
+
+    for (const entry of entries) {
+      if (entry.unique) {
+        const result = this.config.database.insertUnique
+          ? await this.config.database.insertUnique(entry.job, entry.unique, tx)
+          : await this.insertUniqueUnsafely(entry.job, entry.unique, tx);
+        results.push(result);
+      } else {
+        results.push({ job: await this.config.database.insertJob(entry.job, tx), conflict: false });
+      }
+    }
+
+    return results;
   }
 
   async getJob(id: number): Promise<Job | null> {

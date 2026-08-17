@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import type {
+  BulkJobInsert,
   Job,
   JobCriteria,
   JobListCriteria,
@@ -13,9 +14,13 @@ import {
   BaseAdapter,
   DEFAULT_BATCH_SIZE,
   DEFAULT_NODE_TTL,
+  INSERT_JOB_COLUMNS,
   SQL,
   buildStateCounts,
+  chunkArray,
   criteriaClause,
+  groupBulkRuns,
+  maxRowsPerStatement,
   orderByClause,
   resolveListLimit,
   resolveListOffset,
@@ -26,6 +31,15 @@ import { telemetry } from '../core/telemetry.js';
 
 /** Arbitrary but fixed: all izi-queue instances must agree on this value. */
 const MIGRATION_LOCK_KEY = '7451092386401173';
+
+/**
+ * PostgreSQL's extended query protocol encodes the bound-parameter count as a
+ * signed 16-bit integer, so a single statement cannot bind more than 65535
+ * parameters. `insertJobs` chunks its multi-row INSERTs to stay under it:
+ * floor(65535 / 12 columns) = 5461 rows per statement.
+ */
+const PG_MAX_BIND_PARAMS = 65535;
+export const INSERT_JOBS_CHUNK_SIZE = maxRowsPerStatement(PG_MAX_BIND_PARAMS);
 
 function uniqueLookupSql(withPeriod: boolean): string {
   return `
@@ -361,29 +375,89 @@ export class PostgresAdapter extends BaseAdapter {
     return result.rows[0] ? rowToJob(result.rows[0]) : null;
   }
 
+  /**
+   * Checks `job`/`options` against pre-existing rows under an advisory lock
+   * and inserts unless one is found. Shared by `insertUnique` (called with
+   * whichever client owns the transaction) and `insertJobs` (called once per
+   * unique run within the batch's transaction).
+   */
+  private async claimUnique(
+    client: Pool | PoolClient,
+    job: Omit<Job, 'id' | 'insertedAt'>,
+    options: UniqueOptions
+  ): Promise<{ job: Job; conflict: boolean }> {
+    const { states, period } = this.uniqueLookup(options);
+    const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
+
+    // Transaction-scoped, so it is held until whoever owns the transaction
+    // commits -- the caller when they supplied one, otherwise us.
+    await client.query('SELECT pg_advisory_xact_lock($1)', [advisoryLockKey(uniqueKey)]);
+
+    const existing = await client.query(
+      uniqueLookupSql(period !== null),
+      period !== null ? [uniqueKey, states, period] : [uniqueKey, states]
+    );
+
+    if (existing.rows[0]) {
+      return { job: rowToJob(existing.rows[0]), conflict: true };
+    }
+
+    const inserted = await client.query(SQL.postgres.insertJob, [
+      job.state,
+      job.queue,
+      job.worker,
+      JSON.stringify(job.args),
+      JSON.stringify(job.meta),
+      job.tags,
+      JSON.stringify(job.errors),
+      job.attempt,
+      job.maxAttempts,
+      job.priority,
+      job.scheduledAt,
+      uniqueKey
+    ]);
+
+    return { job: rowToJob(inserted.rows[0]), conflict: false };
+  }
+
   async insertUnique(
     job: Omit<Job, 'id' | 'insertedAt'>,
     options: UniqueOptions,
     tx?: TransactionHandle
   ): Promise<{ job: Job; conflict: boolean }> {
-    const { states, period } = this.uniqueLookup(options);
-    const uniqueKey = job.uniqueKey ?? computeUniqueKey(job, options);
+    // Inside the caller's transaction: their BEGIN/COMMIT governs atomicity,
+    // and issuing our own would end their transaction early.
+    if (tx !== undefined) {
+      return this.claimUnique(this.executor(tx), job, options);
+    }
 
-    const claim = async (client: Pool | PoolClient): Promise<{ job: Job; conflict: boolean }> => {
-      // Transaction-scoped, so it is held until whoever owns the transaction
-      // commits -- the caller when they supplied one, otherwise us.
-      await client.query('SELECT pg_advisory_xact_lock($1)', [advisoryLockKey(uniqueKey)]);
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await this.claimUnique(client, job, options);
+      await client.query('COMMIT');
+      return result;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
 
-      const existing = await client.query(
-        uniqueLookupSql(period !== null),
-        period !== null ? [uniqueKey, states, period] : [uniqueKey, states]
-      );
+  /** One multi-row `INSERT ... RETURNING *`, sized to stay under the bind-parameter cap. */
+  private async insertPlainChunk(
+    client: Pool | PoolClient,
+    batch: Omit<Job, 'id' | 'insertedAt'>[]
+  ): Promise<Job[]> {
+    const values: string[] = [];
+    const params: unknown[] = [];
 
-      if (existing.rows[0]) {
-        return { job: rowToJob(existing.rows[0]), conflict: true };
-      }
-
-      const inserted = await client.query(SQL.postgres.insertJob, [
+    batch.forEach((job, i) => {
+      const base = i * INSERT_JOB_COLUMNS;
+      const placeholders = Array.from({ length: INSERT_JOB_COLUMNS }, (_, j) => `$${base + j + 1}`);
+      values.push(`(${placeholders.join(', ')})`);
+      params.push(
         job.state,
         job.queue,
         job.worker,
@@ -395,24 +469,67 @@ export class PostgresAdapter extends BaseAdapter {
         job.maxAttempts,
         job.priority,
         job.scheduledAt,
-        uniqueKey
-      ]);
+        job.uniqueKey ?? null
+      );
+    });
 
-      return { job: rowToJob(inserted.rows[0]), conflict: false };
+    const result = await client.query(
+      `
+        INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, attempt, max_attempts, priority, scheduled_at, unique_key)
+        VALUES ${values.join(', ')}
+        RETURNING *
+      `,
+      params
+    );
+
+    return result.rows.map(rowToJob);
+  }
+
+  /** Chunks `jobs` (all non-unique) across as many `insertPlainChunk` calls as needed. */
+  private async insertPlainRun(
+    client: Pool | PoolClient,
+    jobs: Omit<Job, 'id' | 'insertedAt'>[]
+  ): Promise<{ job: Job; conflict: boolean }[]> {
+    const out: { job: Job; conflict: boolean }[] = [];
+    for (const batch of chunkArray(jobs, INSERT_JOBS_CHUNK_SIZE)) {
+      const inserted = await this.insertPlainChunk(client, batch);
+      out.push(...inserted.map(job => ({ job, conflict: false })));
+    }
+    return out;
+  }
+
+  async insertJobs(
+    jobs: BulkJobInsert[],
+    tx?: TransactionHandle
+  ): Promise<{ job: Job; conflict: boolean }[]> {
+    if (jobs.length === 0) return [];
+
+    const runs = groupBulkRuns(jobs);
+
+    const runAll = async (client: Pool | PoolClient): Promise<{ job: Job; conflict: boolean }[]> => {
+      const out: { job: Job; conflict: boolean }[] = [];
+      for (const run of runs) {
+        if (run.kind === 'plain') {
+          out.push(...await this.insertPlainRun(client, run.jobs));
+        } else {
+          out.push(await this.claimUnique(client, run.job, run.unique));
+        }
+      }
+      return out;
     };
 
     // Inside the caller's transaction: their BEGIN/COMMIT governs atomicity,
-    // and issuing our own would end their transaction early.
+    // same as `insertUnique`.
     if (tx !== undefined) {
-      return claim(this.executor(tx));
+      return runAll(this.executor(tx));
     }
 
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
-      const result = await claim(client);
+      const out = await runAll(client);
       await client.query('COMMIT');
-      return result;
+      return out;
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {});
       throw error;

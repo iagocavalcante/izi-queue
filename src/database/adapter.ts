@@ -1,11 +1,13 @@
 import type {
+  BulkJobInsert,
   DatabaseAdapter,
   Job,
   JobOrderBy,
   JobOrderByField,
   JobState,
   JobStateCounts,
-  Logger
+  Logger,
+  UniqueOptions
 } from '../types.js';
 import { DEFAULT_UNIQUE_PERIOD, DEFAULT_UNIQUE_STATES } from '../core/unique.js';
 import { consoleLogger } from '../core/logger.js';
@@ -58,6 +60,66 @@ export async function runInBatches(
     // to run between batches instead of monopolizing it.
     await new Promise<void>(resolve => setImmediate(resolve));
   }
+}
+
+/**
+ * Column count of a single `izi_jobs` insert row: state, queue, worker, args,
+ * meta, tags, errors, attempt, max_attempts, priority, scheduled_at,
+ * unique_key. `insertJobs` sizes its chunks off this so a single multi-row
+ * INSERT statement cannot exceed a database's bind-parameter limit.
+ */
+export const INSERT_JOB_COLUMNS = 12;
+
+/**
+ * How many rows of `columns` columns each fit under `paramLimit` bind
+ * parameters, rounded down so the chunk never reaches the limit.
+ */
+export function maxRowsPerStatement(paramLimit: number, columns: number = INSERT_JOB_COLUMNS): number {
+  return Math.max(1, Math.floor(paramLimit / columns));
+}
+
+export function chunkArray<T>(items: T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
+/**
+ * A run of consecutive `insertJobs` entries that share how they must be
+ * inserted: a `plain` run is anything without `unique`, safe to fold into one
+ * multi-row INSERT (or several, chunked); a `unique` run is always a single
+ * entry, since each one needs its own check-then-insert against the database.
+ *
+ * Grouping into runs -- rather than partitioning the whole batch into "all
+ * plain" and "all unique" up front -- preserves the caller's ordering without
+ * giving up multi-row batching for the (typically dominant) plain jobs: two
+ * plain entries stay in the same INSERT as long as nothing unique-only sits
+ * between them in the input.
+ */
+export type BulkRun =
+  | { kind: 'plain'; jobs: Omit<Job, 'id' | 'insertedAt'>[] }
+  | { kind: 'unique'; job: Omit<Job, 'id' | 'insertedAt'>; unique: UniqueOptions };
+
+export function groupBulkRuns(entries: BulkJobInsert[]): BulkRun[] {
+  const runs: BulkRun[] = [];
+
+  for (const entry of entries) {
+    if (entry.unique) {
+      runs.push({ kind: 'unique', job: entry.job, unique: entry.unique });
+      continue;
+    }
+
+    const last = runs[runs.length - 1];
+    if (last?.kind === 'plain') {
+      last.jobs.push(entry.job);
+    } else {
+      runs.push({ kind: 'plain', jobs: [entry.job] });
+    }
+  }
+
+  return runs;
 }
 
 export const SQL = {

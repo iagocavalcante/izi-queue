@@ -183,6 +183,22 @@ export interface BackoffOptions {
   jitterPercent?: number;
 }
 
+/**
+ * One job to insert as part of a bulk batch passed to `insertJobs`. `unique`
+ * mirrors `JobInsertOptions.unique` on a single `insert` -- when present the
+ * adapter must check it against pre-existing rows before inserting, exactly
+ * like `insertUnique`, and return the existing row with `conflict: true`
+ * instead of inserting a duplicate.
+ *
+ * Callers must not pass two entries whose `unique` options resolve to the
+ * same key -- `IziQueue.insertAll` deduplicates by key before calling this,
+ * so `insertJobs` only ever has to check a given entry against the database.
+ */
+export interface BulkJobInsert {
+  job: Omit<Job, 'id' | 'insertedAt'>;
+  unique?: UniqueOptions;
+}
+
 export type WorkerResult =
   | { status: 'ok'; value?: unknown }
   | { status: 'error'; error: Error | string }
@@ -375,6 +391,27 @@ export interface DatabaseAdapter {
     options: UniqueOptions,
     tx?: TransactionHandle
   ): Promise<{ job: Job; conflict: boolean }>;
+  /**
+   * Inserts every job in `jobs` in as few round trips as the database's
+   * parameter limits allow, wrapped in one transaction -- the caller's, if
+   * `tx` is given, otherwise one this call opens and commits or rolls back
+   * itself. A failure partway through leaves nothing behind, unlike calling
+   * `insertJob`/`insertUnique` once per job.
+   *
+   * Results are returned in the same order as `jobs`. An entry with no
+   * `unique` is always inserted (`conflict: false`); an entry with `unique`
+   * that matches a pre-existing row comes back with that row and
+   * `conflict: true`, exactly like `insertUnique`.
+   *
+   * Optional so a third-party adapter written before this existed keeps
+   * compiling; `IziQueue.insertAll` falls back to one `insertJob`/
+   * `insertUnique` call per job (i.e. today's non-atomic, N-round-trip
+   * behavior) when an adapter does not implement it.
+   */
+  insertJobs?(
+    jobs: BulkJobInsert[],
+    tx?: TransactionHandle
+  ): Promise<{ job: Job; conflict: boolean }[]>;
   close(): Promise<void>;
   listen?(callback: (event: { queue: string }) => void): Promise<void>;
   /**
