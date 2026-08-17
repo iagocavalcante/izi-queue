@@ -90,6 +90,17 @@ export type WorkerResult =
   | { status: 'cancel'; reason: string }
   | { status: 'snooze'; seconds: number };
 
+/**
+ * How a single job resolved when executed inline by `IziQueue.drain()`.
+ * `failure` is an error with retry budget left (the job becomes `retryable`);
+ * `discarded` covers both an error with no attempts left and an unregistered
+ * worker -- both land the job in the `discarded` state.
+ */
+export type DrainOutcome = 'success' | 'failure' | 'snoozed' | 'discarded' | 'cancelled';
+
+/** Tally of drain outcomes, returned by `IziQueue.drain()`. */
+export type DrainResult = Record<DrainOutcome, number>;
+
 export interface ResourceLimits {
   maxOldGenerationSizeMb?: number;
   maxYoungGenerationSizeMb?: number;

@@ -1,5 +1,6 @@
 import type {
   DatabaseAdapter,
+  DrainResult,
   IziQueueConfig,
   IsolationConfig,
   Job,
@@ -436,28 +437,58 @@ export class IziQueue {
     }
   }
 
-  async drain(queueName?: string): Promise<void> {
-    const queuesToDrain = queueName
-      ? [this.queues.get(queueName)].filter(Boolean)
-      : Array.from(this.queues.values());
+  /**
+   * Synchronously runs every available job in the given queue (or all queues)
+   * to completion, modeled on `Oban.drain_queue/2`. Jobs are fetched (which
+   * marks them `executing` and consumes one attempt, same as the live poller)
+   * and executed inline through the same worker-execution path the poller
+   * uses, one at a time, until a fetch comes back empty.
+   *
+   * If the queue is currently running, its poller is paused for the duration
+   * of the drain and resumed afterward -- otherwise the poller and the inline
+   * executor would race to claim the same backlog. A poll already in flight
+   * when drain() is called is allowed to finish claiming its jobs first; those
+   * jobs are not re-fetched here; and they run to completion independently,
+   * so they are not reflected in the returned tally.
+   */
+  async drain(queueName?: string): Promise<DrainResult> {
+    const queuesToDrain: Queue[] = (
+      queueName ? [this.queues.get(queueName)] : Array.from(this.queues.values())
+    ).filter((queue): queue is Queue => queue !== undefined);
 
-    await this.stageJobs();
+    // Pausing is synchronous and happens before any other work here, so
+    // nothing can slip a new poll in between deciding to drain and doing so.
+    const pausedQueues = queuesToDrain.filter(queue => queue.currentState === 'running');
+    pausedQueues.forEach(queue => queue.pause());
 
-    let hasJobs = true;
-    while (hasJobs) {
-      hasJobs = false;
+    try {
+      await Promise.all(queuesToDrain.map(queue => queue.awaitInFlightPoll()));
+
+      await this.stageJobs();
+
+      const tally: DrainResult = {
+        success: 0,
+        failure: 0,
+        snoozed: 0,
+        discarded: 0,
+        cancelled: 0
+      };
+
       for (const queue of queuesToDrain) {
-        if (!queue) continue;
-        const jobs = await this.config.database.fetchJobs(queue.name, queue.limit);
-        if (jobs.length > 0) {
-          hasJobs = true;
+        let jobs = await this.config.database.fetchJobs(queue.name, queue.limit, this.config.node);
+
+        while (jobs.length > 0) {
           for (const job of jobs) {
-            await this.config.database.updateJob(job.id, { state: 'available' });
+            const outcome = await queue.executeInline(job);
+            tally[outcome] += 1;
           }
-          queue.dispatch();
-          await new Promise(resolve => setTimeout(resolve, 100));
+          jobs = await this.config.database.fetchJobs(queue.name, queue.limit, this.config.node);
         }
       }
+
+      return tally;
+    } finally {
+      pausedQueues.forEach(queue => queue.resume());
     }
   }
 }

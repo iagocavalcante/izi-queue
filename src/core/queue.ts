@@ -1,4 +1,4 @@
-import type { DatabaseAdapter, Job, QueueConfig } from '../types.js';
+import type { DatabaseAdapter, DrainOutcome, Job, QueueConfig } from '../types.js';
 import { formatError, sourceStatesFor } from './job.js';
 import { executeWorker, getBackoffDelay, hasWorker, getWorker, terminateIsolatedJob } from './worker.js';
 import { telemetry } from './telemetry.js';
@@ -127,6 +127,31 @@ export class Queue {
   }
 
   /**
+   * Resolves once any poll currently in flight has finished fetching.
+   * `IziQueue.drain()` calls this right after pausing so a fetch the live
+   * poller already started cannot still be claiming jobs from this queue's
+   * backlog when the inline executor starts claiming its own.
+   */
+  async awaitInFlightPoll(): Promise<void> {
+    if (this.pollInFlight) {
+      await this.pollInFlight.catch(() => {});
+    }
+  }
+
+  /**
+   * Executes `job` synchronously through the same worker-execution path the
+   * live poller uses -- `executeWorker`, then the ordinary state-machine
+   * transition for whatever it returns -- and reports the outcome instead of
+   * discarding it. This is the inline executor behind `IziQueue.drain()`; the
+   * caller is responsible for having fetched `job` (which already marked it
+   * `executing` and incremented its attempt) and for keeping the live poller
+   * from fetching the same backlog concurrently.
+   */
+  async executeInline(job: Job): Promise<DrainOutcome> {
+    return this.runJob(job);
+  }
+
+  /**
    * Schedules the next poll, replacing any pending one.
    *
    * Always clearing first is what keeps a single poll loop per queue: `dispatch()`
@@ -195,7 +220,7 @@ export class Queue {
     }
   }
 
-  private async runJob(job: Job): Promise<void> {
+  private async runJob(job: Job): Promise<DrainOutcome> {
     const startTime = Date.now();
 
     telemetry.emit('job:start', { job, queue: this.name });
@@ -205,7 +230,7 @@ export class Queue {
       // node, so retrying only occupies fetch slots for hours before the job is
       // discarded anyway.
       await this.handleUnknownWorker(job, startTime);
-      return;
+      return 'discarded';
     }
 
     const worker = getWorker(job.worker);
@@ -222,23 +247,22 @@ export class Queue {
       switch (result.status) {
         case 'ok':
           await this.handleSuccess(job, result.value, duration);
-          break;
+          return 'success';
         case 'error':
-          await this.handleError(
+          return await this.handleError(
             job,
             result.error instanceof Error ? result.error : new Error(String(result.error)),
             startTime
           );
-          break;
         case 'cancel':
           await this.handleCancel(job, result.reason, duration);
-          break;
+          return 'cancelled';
         case 'snooze':
           await this.handleSnooze(job, result.seconds, duration);
-          break;
+          return 'snoozed';
       }
     } catch (error) {
-      await this.handleError(
+      return await this.handleError(
         job,
         error instanceof Error ? error : new Error(String(error)),
         startTime
@@ -305,7 +329,11 @@ export class Queue {
     });
   }
 
-  private async handleError(job: Job, error: Error, startTime: number): Promise<void> {
+  private async handleError(
+    job: Job,
+    error: Error,
+    startTime: number
+  ): Promise<'failure' | 'discarded'> {
     const duration = Date.now() - startTime;
     const newErrors = [...job.errors, formatError(error, job.attempt)];
 
@@ -314,7 +342,7 @@ export class Queue {
         errors: newErrors,
         discardedAt: new Date()
       });
-      if (!applied) return;
+      if (!applied) return 'discarded';
 
       telemetry.emit('job:error', {
         job: { ...job, state: 'discarded', errors: newErrors },
@@ -322,6 +350,7 @@ export class Queue {
         duration,
         error
       });
+      return 'discarded';
     } else {
       const backoffMs = getBackoffDelay(job);
       const scheduledAt = new Date(Date.now() + backoffMs);
@@ -330,7 +359,7 @@ export class Queue {
         errors: newErrors,
         scheduledAt
       });
-      if (!applied) return;
+      if (!applied) return 'failure';
 
       telemetry.emit('job:error', {
         job: { ...job, state: 'retryable', errors: newErrors },
@@ -338,6 +367,7 @@ export class Queue {
         duration,
         error
       });
+      return 'failure';
     }
   }
 
