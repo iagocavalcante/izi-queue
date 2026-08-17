@@ -66,11 +66,51 @@ export interface JobCriteria {
   worker?: string;
   state?: JobState[];
   /**
+   * Match-any: a job matches if it has at least one of these tags. Kept
+   * consistent across all three adapters -- Postgres uses `&&` (array
+   * overlap), MySQL `JSON_OVERLAPS`, SQLite a `json_each` membership check.
+   * Match-all was the alternative; match-any was chosen because the
+   * operational question this answers ("jobs tagged billing or urgent") is
+   * naturally an OR, and it maps onto a single native operator on every
+   * dialect instead of a chain of per-tag containment checks.
+   */
+  tags?: string[];
+  /**
    * Required to act on every job. Without it an empty criteria object is
    * rejected, so a handler forwarding optional filters cannot wipe the queue.
    */
   all?: boolean;
 }
+
+/**
+ * Fields `listJobs` may sort by, whitelisted by name -- `orderBy` can never
+ * carry free-form SQL, which is exactly the injection class fixed in #18.
+ */
+export type JobOrderByField = 'id' | 'priority' | 'scheduledAt' | 'insertedAt' | 'attemptedAt';
+
+export interface JobOrderBy {
+  field: JobOrderByField;
+  /** Defaults to 'desc'. */
+  direction?: 'asc' | 'desc';
+}
+
+export interface JobListCriteria extends JobCriteria {
+  /**
+   * Defaults to `DEFAULT_LIST_LIMIT` (100) and is capped at `MAX_LIST_LIMIT`
+   * (1000) regardless of what is requested -- see `database/adapter.ts`.
+   */
+  limit?: number;
+  offset?: number;
+  /** Defaults to `{ field: 'insertedAt', direction: 'desc' }`. */
+  orderBy?: JobOrderBy;
+}
+
+/**
+ * Job counts grouped by state. Every `JobState` key is always present (zero
+ * when nothing matches), so a caller building a /health response never has to
+ * guard against a missing key.
+ */
+export type JobStateCounts = Record<JobState, number>;
 
 /**
  * A caller-managed transaction handle, passed straight through to the adapter.
@@ -294,6 +334,21 @@ export interface DatabaseAdapter {
   cancelJobs(criteria: JobCriteria): Promise<number>;
   /** Returns discarded or cancelled jobs to the queue. */
   retryJobs?(criteria: JobCriteria): Promise<number>;
+  /**
+   * Lists jobs matching `criteria` so callers stop hand-writing SQL against
+   * `izi_jobs`. Ordered and paginated with a bounded, whitelisted `orderBy`
+   * and a default+max `limit` -- see `DEFAULT_LIST_LIMIT`/`MAX_LIST_LIMIT` in
+   * `database/adapter.ts`. Optional so third-party adapters predating this
+   * method keep compiling; `IziQueue.listJobs` throws a clear error when the
+   * configured adapter does not implement it.
+   */
+  listJobs?(criteria: JobListCriteria): Promise<Job[]>;
+  /**
+   * Counts jobs matching `criteria` (the same filters as `listJobs` minus
+   * pagination/ordering), grouped by state. Optional for the same
+   * backward-compatibility reason as `listJobs`.
+   */
+  countJobs?(criteria: JobCriteria): Promise<JobStateCounts>;
   /**
    * Returns jobs abandoned by dead nodes to the queue (or discards them when
    * their attempts are exhausted). `nodeTtl` is how many seconds a node may go

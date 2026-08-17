@@ -1,6 +1,26 @@
 import type { Pool, PoolClient } from 'pg';
-import type { Job, JobCriteria, JobState, Logger, TransactionHandle, UniqueOptions } from '../types.js';
-import { BaseAdapter, DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
+import type {
+  Job,
+  JobCriteria,
+  JobListCriteria,
+  JobState,
+  JobStateCounts,
+  Logger,
+  TransactionHandle,
+  UniqueOptions
+} from '../types.js';
+import {
+  BaseAdapter,
+  DEFAULT_BATCH_SIZE,
+  DEFAULT_NODE_TTL,
+  SQL,
+  buildStateCounts,
+  criteriaClause,
+  orderByClause,
+  resolveListLimit,
+  resolveListOffset,
+  rowToJob
+} from './adapter.js';
 import { advisoryLockKey, computeUniqueKey } from '../core/unique.js';
 import { telemetry } from '../core/telemetry.js';
 
@@ -265,7 +285,7 @@ export class PostgresAdapter extends BaseAdapter {
   }
 
   async cancelJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, i => `$${i}`);
+    const { clause, params } = criteriaClause(criteria, i => `$${i}`, 'postgres');
     const result = await this.pool.query(
       `${SQL.postgres.cancelJobs}${clause}`,
       params
@@ -274,7 +294,7 @@ export class PostgresAdapter extends BaseAdapter {
   }
 
   async retryJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, i => `$${i}`);
+    const { clause, params } = criteriaClause(criteria, i => `$${i}`, 'postgres');
     // Raising max_attempts matters for jobs discarded after exhausting them:
     // without headroom the job is discarded again on its very next fetch.
     const result = await this.pool.query(
@@ -290,6 +310,28 @@ export class PostgresAdapter extends BaseAdapter {
       params
     );
     return result.rowCount ?? 0;
+  }
+
+  async listJobs(criteria: JobListCriteria = {}): Promise<Job[]> {
+    const { clause, params } = criteriaClause(criteria, i => `$${i}`, 'postgres');
+    const limit = resolveListLimit(criteria.limit);
+    const offset = resolveListOffset(criteria.offset);
+    const order = orderByClause(criteria.orderBy);
+
+    const result = await this.pool.query(
+      `SELECT * FROM izi_jobs WHERE 1=1${clause} ${order} LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    );
+    return result.rows.map(rowToJob);
+  }
+
+  async countJobs(criteria: JobCriteria = {}): Promise<JobStateCounts> {
+    const { clause, params } = criteriaClause(criteria, i => `$${i}`, 'postgres');
+    const result = await this.pool.query(
+      `SELECT state, COUNT(*)::int AS count FROM izi_jobs WHERE 1=1${clause} GROUP BY state`,
+      params
+    );
+    return buildStateCounts(result.rows);
   }
 
   async rescueStuckJobs(rescueAfter: number, nodeTtl = DEFAULT_NODE_TTL): Promise<number> {

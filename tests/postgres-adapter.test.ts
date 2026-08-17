@@ -211,6 +211,114 @@ describePostgres('PostgresAdapter', () => {
     expect(after.rows).toHaveLength(0);
   });
 
+  describe('listJobs', () => {
+    it('filters by queue, worker, state, and ids', async () => {
+      const a = await adapter.insertJob(jobData({ queue: 'default', worker: 'WorkerA', state: 'available' }));
+      await adapter.insertJob(jobData({ queue: 'other', worker: 'WorkerB', state: 'completed' }));
+
+      expect(await adapter.listJobs({ queue: 'default' })).toHaveLength(1);
+      expect(await adapter.listJobs({ worker: 'WorkerA' })).toHaveLength(1);
+      expect(await adapter.listJobs({ state: ['completed'] })).toHaveLength(1);
+      expect((await adapter.listJobs({ ids: [a.id] }))[0].id).toBe(a.id);
+    });
+
+    it('matches tags with array-overlap (match-any) semantics', async () => {
+      await adapter.insertJob(jobData({ tags: ['billing'] }));
+      await adapter.insertJob(jobData({ tags: ['urgent'] }));
+      await adapter.insertJob(jobData({ tags: ['other'] }));
+      await adapter.insertJob(jobData({ tags: [] }));
+
+      const jobs = await adapter.listJobs({ tags: ['billing', 'urgent'] });
+
+      expect(jobs).toHaveLength(2);
+      expect(jobs.map((j) => j.tags).sort()).toEqual([['billing'], ['urgent']]);
+    });
+
+    it('combines multiple criteria with AND', async () => {
+      await adapter.insertJob(jobData({ queue: 'default', worker: 'WorkerA' }));
+      await adapter.insertJob(jobData({ queue: 'default', worker: 'WorkerB' }));
+
+      expect(await adapter.listJobs({ queue: 'default', worker: 'WorkerA' })).toHaveLength(1);
+    });
+
+    it('orders by insertedAt desc by default', async () => {
+      const first = await adapter.insertJob(jobData({ args: { order: 1 } }));
+      await pool.query(`UPDATE izi_jobs SET inserted_at = NOW() - INTERVAL '1 minute' WHERE id = $1`, [first.id]);
+      const second = await adapter.insertJob(jobData({ args: { order: 2 } }));
+
+      const jobs = await adapter.listJobs({});
+
+      expect(jobs.map((j) => j.id)).toEqual([second.id, first.id]);
+    });
+
+    it('orders by a whitelisted field and direction', async () => {
+      await adapter.insertJob(jobData({ priority: 5 }));
+      await adapter.insertJob(jobData({ priority: 1 }));
+      await adapter.insertJob(jobData({ priority: 3 }));
+
+      const jobs = await adapter.listJobs({ orderBy: { field: 'priority', direction: 'asc' } });
+
+      expect(jobs.map((j) => j.priority)).toEqual([1, 3, 5]);
+    });
+
+    it('rejects an orderBy field outside the whitelist', async () => {
+      await expect(
+        adapter.listJobs({ orderBy: { field: 'args' as never, direction: 'asc' } })
+      ).rejects.toThrow(/invalid listJobs orderBy\.field/);
+    });
+
+    it('applies limit and offset for pagination', async () => {
+      for (let i = 0; i < 5; i++) {
+        await adapter.insertJob(jobData({ priority: i }));
+      }
+
+      const page1 = await adapter.listJobs({ limit: 2, offset: 0, orderBy: { field: 'priority', direction: 'asc' } });
+      const page2 = await adapter.listJobs({ limit: 2, offset: 2, orderBy: { field: 'priority', direction: 'asc' } });
+
+      expect(page1.map((j) => j.priority)).toEqual([0, 1]);
+      expect(page2.map((j) => j.priority)).toEqual([2, 3]);
+    });
+
+    it('returns full Job objects shaped like getJob', async () => {
+      const inserted = await adapter.insertJob(jobData({ args: { a: 1 }, meta: { b: 2 } }));
+
+      const [job] = await adapter.listJobs({ ids: [inserted.id] });
+      const viaGetJob = await adapter.getJob(inserted.id);
+
+      expect(job).toEqual(viaGetJob);
+    });
+  });
+
+  describe('countJobs', () => {
+    it('groups counts by state, with every state present even at zero', async () => {
+      await adapter.insertJob(jobData({ state: 'available' }));
+      await adapter.insertJob(jobData({ state: 'available' }));
+      await adapter.insertJob(jobData({ state: 'completed' }));
+
+      const counts = await adapter.countJobs({});
+
+      expect(counts).toEqual({
+        scheduled: 0,
+        available: 2,
+        executing: 0,
+        retryable: 0,
+        completed: 1,
+        discarded: 0,
+        cancelled: 0
+      });
+    });
+
+    it('applies criteria before grouping, including tags with the same match-any semantics as listJobs', async () => {
+      await adapter.insertJob(jobData({ queue: 'default', tags: ['billing'], state: 'available' }));
+      await adapter.insertJob(jobData({ queue: 'default', tags: ['other'], state: 'available' }));
+      await adapter.insertJob(jobData({ queue: 'other', tags: ['billing'], state: 'available' }));
+
+      const counts = await adapter.countJobs({ queue: 'default', tags: ['billing'] });
+
+      expect(counts.available).toBe(1);
+    });
+  });
+
   describe('unique jobs', () => {
     const unique = { period: 60 };
 

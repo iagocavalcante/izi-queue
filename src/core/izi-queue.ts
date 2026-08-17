@@ -6,6 +6,8 @@ import type {
   Job,
   JobCriteria,
   JobInsertOptions,
+  JobListCriteria,
+  JobStateCounts,
   TransactionHandle,
   QueueConfig,
   TelemetryEvent,
@@ -45,7 +47,8 @@ function assertScoped(criteria: JobCriteria, operation: string): void {
     (criteria.ids && criteria.ids.length > 0) ||
     criteria.queue ||
     criteria.worker ||
-    (criteria.state && criteria.state.length > 0);
+    (criteria.state && criteria.state.length > 0) ||
+    (criteria.tags && criteria.tags.length > 0);
 
   if (!scoped) {
     throw new Error(
@@ -337,6 +340,43 @@ export class IziQueue {
 
   async getJob(id: number): Promise<Job | null> {
     return this.config.database.getJob(id);
+  }
+
+  /**
+   * Lists jobs matching `criteria` -- filtering by id/queue/worker/state/tags,
+   * ordered and paginated -- so consumers stop hand-writing SQL against
+   * `izi_jobs` and coupling to a schema this library may change (#31).
+   * Read-only, so unlike `cancelJobs`/`retryJobs` it is not required to be
+   * scoped: an empty criteria object simply returns the first page.
+   *
+   * `limit` defaults to 100 and is capped at 1000 regardless of what is
+   * requested. `orderBy` defaults to `{ field: 'insertedAt', direction: 'desc' }`
+   * and its `field` is restricted to a whitelist (`id`, `priority`,
+   * `scheduledAt`, `insertedAt`, `attemptedAt`) -- it can never carry
+   * free-form SQL, which is the injection class fixed in #18.
+   *
+   * `tags`, when given, matches jobs sharing at least one of the listed tags
+   * (match-any), with identical semantics across all three adapters.
+   */
+  async listJobs(criteria: JobListCriteria = {}): Promise<Job[]> {
+    if (!this.config.database.listJobs) {
+      throw new Error('The configured database adapter does not support listJobs');
+    }
+    return this.config.database.listJobs(criteria);
+  }
+
+  /**
+   * Counts jobs matching `criteria` (the same filters as `listJobs`, minus
+   * pagination/ordering), grouped by state. Every `JobState` key is always
+   * present at 0 or above, which is what a `/health` endpoint wants --
+   * `available + scheduled + retryable` for backlog depth, `discarded` for
+   * how many jobs gave up -- without guarding against a missing key.
+   */
+  async countJobs(criteria: JobCriteria = {}): Promise<JobStateCounts> {
+    if (!this.config.database.countJobs) {
+      throw new Error('The configured database adapter does not support countJobs');
+    }
+    return this.config.database.countJobs(criteria);
   }
 
   async cancelJobs(criteria: JobCriteria): Promise<number> {

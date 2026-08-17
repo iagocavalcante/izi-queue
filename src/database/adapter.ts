@@ -1,6 +1,17 @@
-import type { DatabaseAdapter, Job, JobState, Logger } from '../types.js';
+import type {
+  DatabaseAdapter,
+  Job,
+  JobOrderBy,
+  JobOrderByField,
+  JobState,
+  JobStateCounts,
+  Logger
+} from '../types.js';
 import { DEFAULT_UNIQUE_PERIOD, DEFAULT_UNIQUE_STATES } from '../core/unique.js';
 import { consoleLogger } from '../core/logger.js';
+
+/** SQL dialects `criteriaClause`'s tags handling branches on. */
+export type SqlDialect = 'postgres' | 'mysql' | 'sqlite';
 
 /**
  * Seconds a node may go without a heartbeat before it is presumed dead and its
@@ -394,12 +405,46 @@ export const SQL = {
 };
 
 /**
- * Builds the shared filter for bulk job operations. An empty criteria object is
- * rejected by the caller rather than silently matching every job.
+ * Appends the dialect-specific match-any tags predicate. `tags` is stored as
+ * `TEXT[]` on Postgres, and as a JSON array of strings on MySQL and SQLite --
+ * each dialect needs its own operator to express "shares at least one tag":
+ *
+ * - Postgres: `&&`, the native array-overlap operator.
+ * - MySQL: `JSON_OVERLAPS`, available from 8.0.17 (the `mysql:8` image this
+ *   library is tested against ships well past that).
+ * - SQLite: no overlap builtin, so `EXISTS` over `json_each` -- the same JSON1
+ *   function `checkUnique` already relies on -- checking membership per tag.
+ */
+function tagsClause(
+  dialect: SqlDialect,
+  tags: string[],
+  placeholder: (index: number) => string,
+  index: number
+): { clause: string; params: unknown[] } {
+  if (dialect === 'postgres') {
+    return { clause: ` AND tags && ${placeholder(index)}`, params: [tags] };
+  }
+  if (dialect === 'mysql') {
+    return { clause: ` AND JSON_OVERLAPS(tags, ${placeholder(index)})`, params: [JSON.stringify(tags)] };
+  }
+  const placeholders = tags.map((_, i) => placeholder(index + i)).join(',');
+  return {
+    clause: ` AND EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value IN (${placeholders}))`,
+    params: [...tags]
+  };
+}
+
+/**
+ * Builds the shared filter for bulk job operations (`cancelJobs`,
+ * `retryJobs`) and for the read-only query API (`listJobs`, `countJobs`). An
+ * empty criteria object is rejected by callers of the bulk operations rather
+ * than silently matching every job -- see `assertScoped` in `izi-queue.ts`;
+ * `listJobs`/`countJobs` are read-only and impose no such requirement.
  */
 export function criteriaClause(
   criteria: import('../types.js').JobCriteria,
-  placeholder: (index: number) => string
+  placeholder: (index: number) => string,
+  dialect: SqlDialect
 ): { clause: string; params: unknown[] } {
   const params: unknown[] = [];
   let clause = '';
@@ -421,8 +466,107 @@ export function criteriaClause(
     clause += ` AND state IN (${criteria.state.map(() => placeholder(index++)).join(',')})`;
     params.push(...criteria.state);
   }
+  if (criteria.tags && criteria.tags.length > 0) {
+    const tags = tagsClause(dialect, criteria.tags, placeholder, index);
+    clause += tags.clause;
+    params.push(...tags.params);
+    index += dialect === 'sqlite' ? criteria.tags.length : 1;
+  }
 
   return { clause, params };
+}
+
+/**
+ * Default and maximum row count `listJobs` returns per call. The default
+ * keeps an unbounded dashboard query cheap; the cap means a caller-supplied
+ * `limit` can never turn `listJobs` into an unbounded scan of `izi_jobs`,
+ * mirroring why `pruneJobs`/`stageJobs` batch instead of running unbounded.
+ */
+export const DEFAULT_LIST_LIMIT = 100;
+export const MAX_LIST_LIMIT = 1000;
+
+/** Validates and clamps `listJobs`' `limit`, applying `DEFAULT_LIST_LIMIT`. */
+export function resolveListLimit(limit?: number): number {
+  if (limit === undefined) return DEFAULT_LIST_LIMIT;
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new Error(`izi-queue: listJobs limit must be a positive integer, got ${limit}`);
+  }
+  return Math.min(limit, MAX_LIST_LIMIT);
+}
+
+/** Validates `listJobs`' `offset`, defaulting to 0. */
+export function resolveListOffset(offset?: number): number {
+  if (offset === undefined) return 0;
+  if (!Number.isInteger(offset) || offset < 0) {
+    throw new Error(`izi-queue: listJobs offset must be a non-negative integer, got ${offset}`);
+  }
+  return offset;
+}
+
+/**
+ * Maps a whitelisted `JobOrderByField` to its column. The whitelist is the
+ * point: `orderBy` can never carry a caller-supplied column name into SQL,
+ * which is the injection class fixed in #18.
+ */
+const JOB_ORDER_BY_COLUMNS: Record<JobOrderByField, string> = {
+  id: 'id',
+  priority: 'priority',
+  scheduledAt: 'scheduled_at',
+  insertedAt: 'inserted_at',
+  attemptedAt: 'attempted_at'
+};
+
+const DEFAULT_ORDER_BY: Required<JobOrderBy> = { field: 'insertedAt', direction: 'desc' };
+
+/**
+ * Builds `listJobs`' `ORDER BY` clause. Every ordering also breaks ties on
+ * `id` in the same direction, so two jobs sharing the primary sort value
+ * (e.g. the same `insertedAt` millisecond) still sort deterministically --
+ * without that, `limit`/`offset` pagination could skip or repeat a row
+ * across pages depending on how the database happened to break the tie.
+ */
+export function orderByClause(orderBy?: JobOrderBy): string {
+  const field = orderBy?.field ?? DEFAULT_ORDER_BY.field;
+  const direction = orderBy?.direction ?? DEFAULT_ORDER_BY.direction;
+
+  if (direction !== 'asc' && direction !== 'desc') {
+    throw new Error(`izi-queue: listJobs orderBy.direction must be 'asc' or 'desc', got ${String(direction)}`);
+  }
+
+  const column = JOB_ORDER_BY_COLUMNS[field];
+  if (!column) {
+    throw new Error(
+      `izi-queue: invalid listJobs orderBy.field "${String(field)}". Must be one of: ${Object.keys(JOB_ORDER_BY_COLUMNS).join(', ')}`
+    );
+  }
+
+  const sqlDirection = direction.toUpperCase();
+  const tiebreak = field === 'id' ? '' : `, id ${sqlDirection}`;
+  return `ORDER BY ${column} ${sqlDirection}${tiebreak}`;
+}
+
+/** Every job state, used to seed `countJobs`' result so every key is present. */
+export const JOB_STATES: JobState[] = [
+  'scheduled',
+  'available',
+  'executing',
+  'retryable',
+  'completed',
+  'discarded',
+  'cancelled'
+];
+
+/**
+ * Builds `countJobs`' result from `SELECT state, COUNT(*) ... GROUP BY state`
+ * rows, seeding every `JobState` at 0 first so a caller never has to guard
+ * against a state with no matching jobs being absent from the result.
+ */
+export function buildStateCounts(rows: { state: string; count: number | string | bigint }[]): JobStateCounts {
+  const counts = Object.fromEntries(JOB_STATES.map(state => [state, 0])) as JobStateCounts;
+  for (const row of rows) {
+    counts[row.state as JobState] = Number(row.count);
+  }
+  return counts;
 }
 
 export function rowToJob(row: Record<string, unknown>): Job {
