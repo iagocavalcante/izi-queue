@@ -84,6 +84,50 @@ export interface JobInsertOptions<T = Record<string, unknown>> {
   tx?: TransactionHandle;
 }
 
+/**
+ * Named backoff curves for `calculateBackoff`/`WorkerDefinition.backoff`.
+ *
+ * `polynomial` is Oban's default: `attempt^4 + padSeconds + rand(0..jitterMax) *
+ * attempt` seconds. It spreads `maxAttempts: 20` across days rather than hours,
+ * which is what makes a 20-attempt budget meaningful.
+ *
+ * `exponential` is izi-queue's original curve: `basePad + multiplier *
+ * 2^min(attempt, maxPower)` seconds with `±jitterPercent` jitter. Kept for
+ * callers that already depend on its ~17-minute plateau.
+ */
+export type BackoffStrategy = 'polynomial' | 'exponential';
+
+export interface BackoffOptions {
+  /** Which curve to use. Defaults to `'polynomial'`. */
+  strategy?: BackoffStrategy;
+  /**
+   * Cap on the computed delay, in seconds, applied after jitter. Applies to
+   * both strategies. Unset by default -- the polynomial curve is uncapped
+   * (that's the point: it needs to span days for `maxAttempts: 20` to mean
+   * anything), and the exponential curve is already implicitly capped via
+   * `maxPower`.
+   */
+  maxDelay?: number;
+
+  // polynomial-only
+  /** Base seconds added before the polynomial term. Default 15. */
+  padSeconds?: number;
+  /** Exponent applied to `attempt`. Default 4. */
+  power?: number;
+  /** Upper bound (exclusive) of the uniform jitter, scaled by `attempt`. Default 10. */
+  jitterMax?: number;
+
+  // exponential-only
+  /** Base seconds added before the exponential term. Default 15. */
+  basePad?: number;
+  /** Multiplier applied to `2^power`. Default 1. */
+  multiplier?: number;
+  /** Caps `attempt` before it is used as the exponent. Default 10. */
+  maxPower?: number;
+  /** Symmetric jitter as a fraction of the base delay. Default 0.1 (±10%). */
+  jitterPercent?: number;
+}
+
 export type WorkerResult =
   | { status: 'ok'; value?: unknown }
   | { status: 'error'; error: Error | string }
@@ -120,7 +164,12 @@ export interface WorkerDefinition<T = Record<string, unknown>> {
   queue?: string;
   maxAttempts?: number;
   priority?: number;
-  backoff?: (job: Job<T>) => number;
+  /**
+   * A custom backoff function, or a `BackoffOptions` config selecting/tuning
+   * one of the named curves (`calculateBackoff`'s default is used when this
+   * is omitted entirely).
+   */
+  backoff?: ((job: Job<T>) => number) | BackoffOptions;
   timeout?: number;
   isolation?: IsolatedWorkerOptions;
 }

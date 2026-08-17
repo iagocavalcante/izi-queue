@@ -77,11 +77,11 @@ export async function executeWorker(job: Job): Promise<WorkerResult> {
 export function getBackoffDelay(job: Job): number {
   const worker = getWorker(job.worker);
 
-  if (worker?.backoff) {
+  if (typeof worker?.backoff === 'function') {
     return worker.backoff(job);
   }
 
-  return calculateBackoff(job.attempt);
+  return calculateBackoff(job.attempt, worker?.backoff);
 }
 
 export function defineWorker<T = Record<string, unknown>>(

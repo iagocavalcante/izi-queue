@@ -451,11 +451,23 @@ CI runs both on every push, so a change that only works on SQLite fails there.
 
 ## Key Formulas
 
-### Exponential Backoff
+### Backoff
+
+`calculateBackoff(attempt, options?)` in `src/core/job.ts` supports two named
+curves via `options.strategy`, plus an optional `options.maxDelay` cap (seconds,
+applies to either curve). `WorkerDefinition.backoff` accepts a `BackoffOptions`
+object with the same shape, or a custom `(job) => number` function.
 
 ```typescript
-// Default: (15 + 2^attempt) seconds with ±10% jitter
-const base = 15 + Math.pow(2, attempt);
+// Default ('polynomial') -- Oban's curve. Spreads maxAttempts: 20 across
+// ~8.4 days rather than ~3 hours; see README "Retry horizon" for the table.
+const base = Math.pow(attempt, 4) + 15;
+const jitter = Math.random() * 10 * attempt;
+const delayMs = (base + jitter) * 1000;
+
+// 'exponential' -- the original curve, opt-in only. Plateaus at ~17 minutes
+// once attempt reaches maxPower (default 10).
+const base = 15 + Math.pow(2, Math.min(attempt, 10));
 const jitter = base * 0.1 * (Math.random() * 2 - 1);
 const delayMs = (base + jitter) * 1000;
 ```

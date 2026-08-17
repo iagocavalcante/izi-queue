@@ -5,6 +5,7 @@ import {
   getWorkerNames,
   clearWorkers,
   executeWorker,
+  getBackoffDelay,
   defineWorker,
   WorkerResults
 } from '../src/core/worker.js';
@@ -272,6 +273,54 @@ describe('Worker Module', () => {
     it('should create snooze result', () => {
       const result = WorkerResults.snooze(300);
       expect(result).toEqual({ status: 'snooze', seconds: 300 });
+    });
+  });
+
+  describe('getBackoffDelay', () => {
+    it('uses the polynomial default when the worker declares no backoff at all', () => {
+      registerWorker(defineWorker('NoBackoffWorker', async () => WorkerResults.ok()));
+      const job = createMockJob({ worker: 'NoBackoffWorker', attempt: 3 });
+
+      const delay = getBackoffDelay(job);
+
+      // attempt^4 + 15 + rand(0..10)*attempt seconds, in ms
+      expect(delay).toBeGreaterThanOrEqual(96000);
+      expect(delay).toBeLessThanOrEqual(126000);
+    });
+
+    it('calls a custom backoff function when one is provided', () => {
+      registerWorker(defineWorker('CustomFnWorker', async () => WorkerResults.ok(), {
+        backoff: (job) => job.attempt * 60000
+      }));
+      const job = createMockJob({ worker: 'CustomFnWorker', attempt: 3 });
+
+      expect(getBackoffDelay(job)).toBe(180000);
+    });
+
+    it('selects the legacy exponential strategy via a config object', () => {
+      registerWorker(defineWorker('ExponentialWorker', async () => WorkerResults.ok(), {
+        backoff: { strategy: 'exponential', jitterPercent: 0 }
+      }));
+      const job = createMockJob({ worker: 'ExponentialWorker', attempt: 1 });
+
+      // 15 + 2^1 = 17s, no jitter
+      expect(getBackoffDelay(job)).toBe(17000);
+    });
+
+    it('applies maxDelay from a config object', () => {
+      registerWorker(defineWorker('CappedWorker', async () => WorkerResults.ok(), {
+        backoff: { maxDelay: 50 }
+      }));
+      const job = createMockJob({ worker: 'CappedWorker', attempt: 20 });
+
+      expect(getBackoffDelay(job)).toBe(50000);
+    });
+
+    it('falls back to the default when the worker is not registered', () => {
+      const job = createMockJob({ worker: 'GhostWorker', attempt: 0 });
+
+      // attempt 0 is deterministic: 0^4 + 15 + rand(0..10)*0 = 15s
+      expect(getBackoffDelay(job)).toBe(15000);
     });
   });
 });

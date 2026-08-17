@@ -120,22 +120,73 @@ await queue.insert('send_email', {
 
 ### Retries with Backoff
 
+A failed job is retried up to `maxAttempts` times (default 20), waiting between
+attempts according to a backoff curve. The default curve is polynomial,
+matching Oban's default:
+
 ```typescript
 const myWorker = defineWorker('my_worker', async (job) => {
-  // Automatic exponential backoff on failure
-  // Formula: (15 + 2^attempt) seconds with ±10% jitter
+  // Automatic backoff on failure.
+  // Formula: attempt^4 + 15 + rand(0..10) * attempt seconds
   return WorkerResults.error('Something went wrong');
 }, {
   maxAttempts: 5, // Retry up to 5 times
 });
+```
 
-// Or define custom backoff
+#### Retry horizon
+
+The polynomial curve is deliberately steep: it spreads a 20-attempt budget
+across days rather than exhausting it in a few hours, which is what makes
+`maxAttempts: 20` a meaningful safety margin instead of a formality. With the
+default options (jitter shown at its midpoint):
+
+| attempt | delay    | cumulative time    |
+|---------|----------|---------------------|
+| 1       | ~21s     | ~21s                |
+| 5       | ~11min   | ~19min               |
+| 10      | ~2.8hr   | ~7.2hr               |
+| 15      | ~14.1hr  | ~49.8hr (~2.1 days)  |
+| 20      | ~44.5hr  | ~201hr (~8.4 days)   |
+
+> **Behavior change:** prior to backoff curve support, the default curve was
+> exponential and capped at `15 + 2^10 ≈ 17 minutes` per attempt, so all 20
+> attempts of a default worker completed within ~3 hours. If you rely on the
+> old, faster-exhausting timeline, opt back in explicitly (see below) or
+> reduce `maxAttempts`.
+
+#### Choosing a strategy
+
+`backoff` on `defineWorker` accepts either a custom function, or a config
+object selecting and tuning one of the two built-in curves:
+
+```typescript
+// Opt back into the original exponential curve (basePad + multiplier *
+// 2^min(attempt, maxPower) seconds, with ±jitterPercent jitter). Plateaus at
+// ~17 minutes once attempt reaches maxPower (default 10).
+const legacyBackoffWorker = defineWorker('legacy_worker', async (job) => {
+  return WorkerResults.error('Something went wrong');
+}, {
+  backoff: { strategy: 'exponential' },
+});
+
+// Cap either curve's delay, in seconds
+const cappedBackoffWorker = defineWorker('capped_worker', async (job) => {
+  return WorkerResults.error('Something went wrong');
+}, {
+  backoff: { maxDelay: 3600 }, // never wait longer than 1 hour
+});
+
+// Or bypass curves entirely with a custom function
 const customBackoffWorker = defineWorker('custom_worker', async (job) => {
   return WorkerResults.ok();
 }, {
   backoff: (job) => job.attempt * 60, // Linear: 60s, 120s, 180s...
 });
 ```
+
+`calculateBackoff(attempt, options?)` is also exported directly if you want to
+compute a delay outside of a worker definition.
 
 ### Priority Queues
 
