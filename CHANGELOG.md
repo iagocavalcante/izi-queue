@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below 1.0.0, breaking changes are released as minor versions.
 
+## [0.8.0] - 2026-08-17
+
+### Changed
+
+- **The default retry backoff curve changed** (the reason this is a minor
+  version). The old default plateaued at ~17 minutes (`15 + 2^min(attempt, 10)`
+  seconds), so the default `maxAttempts: 20` was exhausted within ~3 hours --
+  too short to survive a real outage. The default is now Oban's polynomial
+  curve, `attempt^4 + 15 + rand(0..10) * attempt` seconds: attempt 20 waits
+  ~44.5 hours and the full 20-attempt horizon spans ~8.4 days. Anyone relying
+  on the old fast-exhausting timeline can opt back in per worker with
+  `backoff: { strategy: 'exponential' }`, and a `maxDelay` cap (seconds)
+  applies to either curve. Custom `backoff` functions are unaffected. See the
+  README's "Retry horizon" table. ([#34])
+
+### Added
+
+- **Cancelling a job now interrupts it mid-flight.** In-process workers
+  receive an `AbortSignal` as a second `perform` argument --
+  `perform(job, { signal })` -- which fires on local cancellation and on the
+  job's own timeout; isolated (worker-thread) jobs are pre-emptively
+  terminated and settle as cancelled without burning a retry. Interruption is
+  local to the executing node; the state-transition guard still keeps a job
+  cancelled elsewhere from being resurrected. Existing single-argument
+  workers are unaffected. ([#30])
+- **Job querying API.** `listJobs({ ids?, queue?, worker?, state?, tags?,
+  limit?, offset?, orderBy? })` and `countJobs(criteria)` (counts grouped by
+  state, every state always present) on `IziQueue` and `DatabaseAdapter`,
+  with a whitelisted ordering surface and stable pagination. Tags filtering
+  is match-any and works on all three databases; `tags` also became a
+  criterion for `cancelJobs`/`retryJobs`. Optional on custom adapters, which
+  keep compiling without it. ([#31])
+- **`insertAll` is now a real bulk insert.** One chunked multi-row `INSERT`
+  per batch inside a single transaction (joining your `tx` when supplied),
+  in-batch deduplication of unique jobs, at most one wake-up notification
+  per queue, and a new `insertAllWithResult` returning per-entry
+  `{ job, conflict }`. A failure rolls the whole batch back. Third-party
+  adapters without `insertJobs` fall back to the previous per-row behavior.
+  ([#32])
+- **Injectable logger.** Pass `logger` (minimal `debug/info/warn/error`
+  interface, pino/winston-compatible) to `IziQueueConfig` and to the adapter
+  factories. The default preserves the previous console output; reconnect
+  progress now logs at `debug`. Staging and fetch failures additionally emit
+  `queue:stage_error`/`queue:fetch_error` telemetry. ([#40])
+
 ## [0.7.1] - 2026-08-17
 
 ### Fixed
@@ -346,9 +391,14 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#50]: https://github.com/iagocavalcante/izi-queue/issues/50
 [#29]: https://github.com/iagocavalcante/izi-queue/issues/29
 [#36]: https://github.com/iagocavalcante/izi-queue/issues/36
+[#31]: https://github.com/iagocavalcante/izi-queue/issues/31
+[#32]: https://github.com/iagocavalcante/izi-queue/issues/32
+[#34]: https://github.com/iagocavalcante/izi-queue/issues/34
+[#40]: https://github.com/iagocavalcante/izi-queue/issues/40
 [0.4.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.3.0...v0.4.0
 [0.4.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.0...v0.4.1
 [0.5.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.1...v0.5.0
 [0.6.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.5.0...v0.6.0
 [0.7.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.6.0...v0.7.0
 [0.7.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.7.0...v0.7.1
+[0.8.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.7.1...v0.8.0
