@@ -72,6 +72,8 @@ export type {
   WorkerDefinition,
   QueueConfig,
   DatabaseAdapter,
+  DrainOutcome,
+  DrainResult,
   IziQueueConfig,
   TelemetryEvent,
   TelemetryPayload,
