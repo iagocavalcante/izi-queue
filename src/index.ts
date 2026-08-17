@@ -70,6 +70,8 @@ export type {
   UniqueOptions,
   WorkerResult,
   WorkerDefinition,
+  BackoffStrategy,
+  BackoffOptions,
   QueueConfig,
   DatabaseAdapter,
   DrainOutcome,
