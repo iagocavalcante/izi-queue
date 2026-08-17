@@ -1,9 +1,17 @@
 import { BasePlugin } from './plugin.js';
 import { telemetry } from '../core/telemetry.js';
+import { DEFAULT_BATCH_SIZE, runInBatches } from '../database/adapter.js';
 
 export interface PrunerConfig {
   interval?: number;
   maxAge?: number;
+  /**
+   * Maximum rows deleted per statement, per prune cycle. A large backlog is
+   * worked in this many rows at a time rather than one unbounded DELETE,
+   * looping (yielding to the event loop between batches) until it is caught
+   * up. Defaults to `DEFAULT_BATCH_SIZE` (5000).
+   */
+  batchSize?: number;
 }
 
 /**
@@ -17,7 +25,8 @@ export class PrunerPlugin extends BasePlugin {
     super();
     this.config = {
       interval: config.interval ?? 60000,
-      maxAge: config.maxAge ?? 86400
+      maxAge: config.maxAge ?? 86400,
+      batchSize: config.batchSize ?? DEFAULT_BATCH_SIZE
     };
   }
 
@@ -37,7 +46,11 @@ export class PrunerPlugin extends BasePlugin {
     if (!this.context || !this.running) return;
 
     try {
-      const pruned = await this.context.database.pruneJobs(this.config.maxAge);
+      const database = this.context.database;
+      const pruned = await runInBatches(
+        limit => database.pruneJobs(this.config.maxAge, limit),
+        this.config.batchSize
+      );
 
       if (pruned > 0) {
         // Deliberately not `job:complete`: pruning is maintenance, and counting
@@ -64,6 +77,10 @@ export class PrunerPlugin extends BasePlugin {
 
     if (this.config.maxAge < 60) {
       errors.push('Pruner maxAge must be at least 60 seconds');
+    }
+
+    if (this.config.batchSize < 1) {
+      errors.push('Pruner batchSize must be at least 1');
     }
 
     return errors;

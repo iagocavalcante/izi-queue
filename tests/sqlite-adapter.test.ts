@@ -362,6 +362,25 @@ describe('SQLiteAdapter', () => {
       const pruned = await adapter.pruneJobs(0); // Would delete everything if terminal
       expect(pruned).toBe(0);
     });
+
+    it('deletes at most `limit` rows per call, leaving the rest for the next batch', async () => {
+      for (let i = 0; i < 12; i++) {
+        db.prepare(`
+          INSERT INTO izi_jobs (state, queue, worker, args, completed_at)
+          VALUES ('completed', 'default', 'OldWorker', '{}', datetime('now', '-10 days'))
+        `).run();
+      }
+      // One non-prunable row that a batch must never touch regardless of limit.
+      await adapter.insertJob(createJobData({ state: 'available' }));
+
+      expect(await adapter.pruneJobs(86400, 5)).toBe(5);
+      expect(await adapter.pruneJobs(86400, 5)).toBe(5);
+      expect(await adapter.pruneJobs(86400, 5)).toBe(2);
+      expect(await adapter.pruneJobs(86400, 5)).toBe(0);
+
+      const remaining = db.prepare('SELECT state FROM izi_jobs').all() as { state: string }[];
+      expect(remaining).toEqual([{ state: 'available' }]);
+    });
   });
 
   describe('stageJobs', () => {
@@ -409,6 +428,31 @@ describe('SQLiteAdapter', () => {
         .prepare('SELECT state FROM izi_jobs WHERE worker = ?')
         .get('RetryableWorker') as { state: string };
       expect(job.state).toBe('available');
+    });
+
+    it('stages at most `limit` rows per call, leaving the rest for the next batch', async () => {
+      for (let i = 0; i < 12; i++) {
+        db.prepare(`
+          INSERT INTO izi_jobs (state, queue, worker, args, scheduled_at)
+          VALUES ('scheduled', 'default', 'DueWorker', '{}', datetime('now', '-1 minute'))
+        `).run();
+      }
+      // One future-scheduled row that a batch must never touch regardless of limit.
+      db.prepare(`
+        INSERT INTO izi_jobs (state, queue, worker, args, scheduled_at)
+        VALUES ('scheduled', 'default', 'FutureWorker', '{}', datetime('now', '+1 hour'))
+      `).run();
+
+      expect(await adapter.stageJobs(5)).toBe(5);
+      expect(await adapter.stageJobs(5)).toBe(5);
+      expect(await adapter.stageJobs(5)).toBe(2);
+      expect(await adapter.stageJobs(5)).toBe(0);
+
+      const states = (db.prepare('SELECT state FROM izi_jobs').all() as { state: string }[]).map(
+        r => r.state
+      );
+      expect(states.filter(s => s === 'available')).toHaveLength(12);
+      expect(states.filter(s => s === 'scheduled')).toHaveLength(1);
     });
   });
 

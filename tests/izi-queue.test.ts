@@ -475,6 +475,70 @@ describe('IziQueue Class', () => {
 
       await queue.shutdown();
     });
+
+    it('prunes across multiple batches when the backlog exceeds batchSize', async () => {
+      // 2.5x the batch size: a single pruneJobs call must run three batches
+      // (5 + 5 + 2) internally rather than leaving most of the backlog behind.
+      for (let i = 0; i < 12; i++) {
+        db.prepare(`
+          INSERT INTO izi_jobs (state, queue, worker, args, completed_at)
+          VALUES ('completed', 'default', 'OldWorker', '{}', datetime('now', '-10 days'))
+        `).run();
+      }
+      db.prepare(`
+        INSERT INTO izi_jobs (state, queue, worker, args)
+        VALUES ('available', 'default', 'KeepWorker', '{}')
+      `).run();
+
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 }
+      });
+
+      const pruned = await queue.pruneJobs(86400 * 7, 5);
+
+      expect(pruned).toBe(12);
+      const remaining = db.prepare('SELECT state FROM izi_jobs').all() as { state: string }[];
+      expect(remaining).toEqual([{ state: 'available' }]);
+
+      await queue.shutdown();
+    });
+  });
+
+  describe('stageJobs batching (internal)', () => {
+    it('stages the whole backlog across multiple batches when it exceeds stageBatchSize', async () => {
+      // 2.5x the batch size: one stage cycle must run three batches (5 + 5 + 2)
+      // internally rather than leaving most of the backlog behind.
+      for (let i = 0; i < 12; i++) {
+        db.prepare(`
+          INSERT INTO izi_jobs (state, queue, worker, args, scheduled_at)
+          VALUES ('scheduled', 'default', 'DueWorker', '{}', datetime('now', '-1 minute'))
+        `).run();
+      }
+      db.prepare(`
+        INSERT INTO izi_jobs (state, queue, worker, args, scheduled_at)
+        VALUES ('scheduled', 'default', 'FutureWorker', '{}', datetime('now', '+1 hour'))
+      `).run();
+
+      const queue = createIziQueue({
+        database: adapter,
+        queues: { default: 5 },
+        stageBatchSize: 5
+      });
+
+      // Exercises the queue's own batching loop directly, without starting
+      // its poll/dispatch machinery, which would otherwise race staged jobs
+      // out of the 'available' state before this can observe them.
+      await (queue as unknown as { stageJobs(): Promise<void> }).stageJobs();
+
+      const states = (db.prepare('SELECT state FROM izi_jobs').all() as { state: string }[]).map(
+        r => r.state
+      );
+      expect(states.filter(s => s === 'available')).toHaveLength(12);
+      expect(states.filter(s => s === 'scheduled')).toHaveLength(1);
+
+      await queue.shutdown();
+    });
   });
 
   describe('rescueStuckJobs', () => {

@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
-import { BaseAdapter, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
+import { BaseAdapter, DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { advisoryLockKey, computeUniqueKey } from '../core/unique.js';
 import { telemetry } from '../core/telemetry.js';
 
@@ -246,13 +246,13 @@ export class PostgresAdapter extends BaseAdapter {
     return result.rows[0] ? rowToJob(result.rows[0]) : null;
   }
 
-  async pruneJobs(maxAge: number): Promise<number> {
-    const result = await this.pool.query(SQL.postgres.pruneJobs, [maxAge]);
+  async pruneJobs(maxAge: number, limit: number = DEFAULT_BATCH_SIZE): Promise<number> {
+    const result = await this.pool.query(SQL.postgres.pruneJobs, [maxAge, limit]);
     return result.rowCount ?? 0;
   }
 
-  async stageJobs(): Promise<number> {
-    const result = await this.pool.query(SQL.postgres.stageJobs);
+  async stageJobs(limit: number = DEFAULT_BATCH_SIZE): Promise<number> {
+    const result = await this.pool.query(SQL.postgres.stageJobs, [limit]);
     return result.rowCount ?? 0;
   }
 

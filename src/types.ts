@@ -182,8 +182,20 @@ export interface DatabaseAdapter {
    */
   updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[]): Promise<Job | null>;
   getJob(id: number): Promise<Job | null>;
-  pruneJobs(maxAge: number): Promise<number>;
-  stageJobs(): Promise<number>;
+  /**
+   * Deletes at most `limit` prunable (completed/discarded/cancelled, past
+   * `maxAge`) rows and returns how many were deleted. Callers wanting the
+   * whole backlog cleared loop on the result rather than relying on a single
+   * unbounded statement, which would lock the table for as long as the
+   * backlog takes to scan. `limit` defaults to a safe batch size when omitted;
+   * a custom adapter that ignores it simply does not batch.
+   */
+  pruneJobs(maxAge: number, limit?: number): Promise<number>;
+  /**
+   * Promotes at most `limit` due scheduled/retryable jobs to available and
+   * returns how many were promoted. Same batching contract as `pruneJobs`.
+   */
+  stageJobs(limit?: number): Promise<number>;
   cancelJobs(criteria: JobCriteria): Promise<number>;
   /** Returns discarded or cancelled jobs to the queue. */
   retryJobs?(criteria: JobCriteria): Promise<number>;
@@ -233,6 +245,13 @@ export interface IziQueueConfig {
   queues: QueueConfig[] | Record<string, number>;
   node?: string;
   stageInterval?: number;
+  /**
+   * Maximum rows staged per statement, per stage cycle. A large backlog is
+   * worked in this many rows at a time rather than one unbounded UPDATE,
+   * looping (yielding to the event loop between batches) until it is caught
+   * up. Defaults to `DEFAULT_BATCH_SIZE` (5000).
+   */
+  stageBatchSize?: number;
   shutdownGracePeriod?: number;
   /**
    * How often this node refreshes its liveness record, in ms. A node is presumed

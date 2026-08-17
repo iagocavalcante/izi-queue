@@ -1,6 +1,6 @@
 import type { Database } from 'better-sqlite3';
 import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
-import { BaseAdapter, DEFAULT_NODE_TTL, criteriaClause, rowToJob } from './adapter.js';
+import { BaseAdapter, DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, criteriaClause, rowToJob } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 import { sqliteMigrations } from './migrations.js';
 
@@ -200,23 +200,34 @@ export class SQLiteAdapter extends BaseAdapter {
     return row ? rowToJob(row) : null;
   }
 
-  async pruneJobs(maxAge: number): Promise<number> {
+  async pruneJobs(maxAge: number, limit: number = DEFAULT_BATCH_SIZE): Promise<number> {
+    // `id IN (SELECT ... LIMIT n)` bounds the batch with standard SQL. A bare
+    // `DELETE ... LIMIT n` only works when SQLite was compiled with
+    // SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which better-sqlite3's build is not.
     const stmt = this.db.prepare(`
       DELETE FROM izi_jobs
-      WHERE state IN ('completed', 'discarded', 'cancelled')
-        AND datetime(COALESCE(completed_at, discarded_at, cancelled_at)) < datetime('now', '-' || ? || ' seconds')
+      WHERE id IN (
+        SELECT id FROM izi_jobs
+        WHERE state IN ('completed', 'discarded', 'cancelled')
+          AND datetime(COALESCE(completed_at, discarded_at, cancelled_at)) < datetime('now', '-' || ? || ' seconds')
+        LIMIT ?
+      )
     `);
-    const result = stmt.run(maxAge);
+    const result = stmt.run(maxAge, limit);
     return result.changes;
   }
 
-  async stageJobs(): Promise<number> {
+  async stageJobs(limit: number = DEFAULT_BATCH_SIZE): Promise<number> {
     const stmt = this.db.prepare(`
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state IN ('scheduled', 'retryable') AND datetime(scheduled_at) <= datetime('now')
+      WHERE id IN (
+        SELECT id FROM izi_jobs
+        WHERE state IN ('scheduled', 'retryable') AND datetime(scheduled_at) <= datetime('now')
+        LIMIT ?
+      )
     `);
-    const result = stmt.run();
+    const result = stmt.run(limit);
     return result.changes;
   }
 

@@ -6,6 +6,7 @@ import {
   clearWorkers
 } from '../src/index.js';
 import { telemetry } from '../src/core/telemetry.js';
+import { DEFAULT_BATCH_SIZE } from '../src/database/adapter.js';
 import type { PluginContext } from '../src/plugins/plugin.js';
 
 describe('Plugins', () => {
@@ -263,6 +264,15 @@ describe('Plugins', () => {
         });
         expect(plugin.name).toBe('pruner');
       });
+
+      it('should accept a custom batchSize', () => {
+        const plugin = createPrunerPlugin({
+          interval: 30000,
+          maxAge: 3600,
+          batchSize: 500
+        });
+        expect(plugin.name).toBe('pruner');
+      });
     });
 
     describe('validate', () => {
@@ -296,6 +306,18 @@ describe('Plugins', () => {
         const errors = plugin.validate();
         expect(errors.length).toBeGreaterThan(0);
         expect(errors[0]).toContain('maxAge');
+      });
+
+      it('should fail validation if batchSize is less than 1', () => {
+        const plugin = createPrunerPlugin({
+          interval: 5000,
+          maxAge: 3600,
+          batchSize: 0
+        });
+
+        const errors = plugin.validate();
+        expect(errors.length).toBeGreaterThan(0);
+        expect(errors[0]).toContain('batchSize');
       });
 
       it('should fail validation for multiple issues', () => {
@@ -373,7 +395,7 @@ describe('Plugins', () => {
         });
 
         // Bypass validation for testing
-        (plugin as any).config = { interval: 100, maxAge: 86400 };
+        (plugin as any).config = { interval: 100, maxAge: 86400, batchSize: DEFAULT_BATCH_SIZE };
 
         await plugin.start(pluginContext);
 
@@ -409,7 +431,7 @@ describe('Plugins', () => {
           maxAge: 86400
         });
 
-        (plugin as any).config = { interval: 100, maxAge: 86400 };
+        (plugin as any).config = { interval: 100, maxAge: 86400, batchSize: DEFAULT_BATCH_SIZE };
 
         await plugin.start(pluginContext);
         await new Promise(resolve => setTimeout(resolve, 200));
@@ -420,6 +442,32 @@ describe('Plugins', () => {
 
         unsubscribe();
         unsubscribeCompleted();
+        await plugin.stop();
+      });
+
+      it('prunes across multiple batches in a single cycle when the backlog exceeds batchSize', async () => {
+        // 2.5x the batch size, so a single prune cycle must run three batches
+        // (5 + 5 + 2) rather than leaving most of the backlog for next time.
+        for (let i = 0; i < 12; i++) {
+          db.prepare(`
+            INSERT INTO izi_jobs (state, queue, worker, args, completed_at)
+            VALUES ('completed', 'default', 'OldWorker', '{}', datetime('now', '-10 days'))
+          `).run();
+        }
+
+        const plugin = createPrunerPlugin({
+          interval: 100,
+          maxAge: 86400,
+          batchSize: 5
+        });
+        (plugin as any).config = { interval: 100, maxAge: 86400, batchSize: 5 };
+
+        await plugin.start(pluginContext);
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        const remaining = db.prepare('SELECT * FROM izi_jobs WHERE worker = ?').all('OldWorker');
+        expect(remaining).toHaveLength(0);
+
         await plugin.stop();
       });
     });
@@ -481,7 +529,7 @@ describe('Plugins', () => {
         interval: 100,
         maxAge: 86400
       });
-      (pruner as any).config = { interval: 100, maxAge: 86400 };
+      (pruner as any).config = { interval: 100, maxAge: 86400, batchSize: DEFAULT_BATCH_SIZE };
 
       await lifeline.start(pluginContext);
       await pruner.start(pluginContext);

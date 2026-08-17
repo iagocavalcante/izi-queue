@@ -103,6 +103,68 @@ describePostgres('PostgresAdapter', () => {
     ]);
   });
 
+  it('stages at most `limit` rows per call, leaving the rest for the next batch', async () => {
+    for (let i = 0; i < 12; i++) {
+      await pool.query(
+        `INSERT INTO izi_jobs (state, queue, worker, args, scheduled_at)
+         VALUES ('scheduled', 'default', 'W', '{}', NOW() - INTERVAL '1 minute')`
+      );
+    }
+    await pool.query(
+      `INSERT INTO izi_jobs (state, queue, worker, args, scheduled_at)
+       VALUES ('scheduled', 'default', 'FutureW', '{}', NOW() + INTERVAL '1 hour')`
+    );
+
+    expect(await adapter.stageJobs(5)).toBe(5);
+    expect(await adapter.stageJobs(5)).toBe(5);
+    expect(await adapter.stageJobs(5)).toBe(2);
+    expect(await adapter.stageJobs(5)).toBe(0);
+
+    const { rows } = await pool.query(
+      `SELECT state, COUNT(*)::int AS count FROM izi_jobs GROUP BY state ORDER BY state`
+    );
+    expect(rows).toEqual([
+      { state: 'available', count: 12 },
+      { state: 'scheduled', count: 1 },
+    ]);
+  });
+
+  it('prunes only terminal jobs past the age cutoff', async () => {
+    await pool.query(
+      `INSERT INTO izi_jobs (state, queue, worker, args, completed_at)
+       VALUES ('completed', 'default', 'W', '{}', NOW() - INTERVAL '2 hours')`
+    );
+    await adapter.insertJob(jobData());
+
+    const pruned = await adapter.pruneJobs(3600);
+
+    expect(pruned).toBe(1);
+    const { rows } = await pool.query(
+      `SELECT state, COUNT(*)::int AS count FROM izi_jobs GROUP BY state ORDER BY state`
+    );
+    expect(rows).toEqual([{ state: 'available', count: 1 }]);
+  });
+
+  it('deletes at most `limit` rows per call, leaving the rest for the next batch', async () => {
+    for (let i = 0; i < 12; i++) {
+      await pool.query(
+        `INSERT INTO izi_jobs (state, queue, worker, args, completed_at)
+         VALUES ('completed', 'default', 'W', '{}', NOW() - INTERVAL '2 hours')`
+      );
+    }
+    await adapter.insertJob(jobData());
+
+    expect(await adapter.pruneJobs(3600, 5)).toBe(5);
+    expect(await adapter.pruneJobs(3600, 5)).toBe(5);
+    expect(await adapter.pruneJobs(3600, 5)).toBe(2);
+    expect(await adapter.pruneJobs(3600, 5)).toBe(0);
+
+    const { rows } = await pool.query(
+      `SELECT state, COUNT(*)::int AS count FROM izi_jobs GROUP BY state ORDER BY state`
+    );
+    expect(rows).toEqual([{ state: 'available', count: 1 }]);
+  });
+
   it('rescues orphans but leaves jobs owned by a live node alone', async () => {
     await adapter.heartbeat('live-node');
     await pool.query(
