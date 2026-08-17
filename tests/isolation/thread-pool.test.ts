@@ -185,7 +185,8 @@ describe('ThreadPool', () => {
       await new Promise(resolve => setTimeout(resolve, 50));
 
       // Terminate the job
-      await pool.terminate(job.id);
+      const found = await pool.terminate(job.id);
+      expect(found).toBe(true);
 
       const result = await executePromise;
 
@@ -193,6 +194,73 @@ describe('ThreadPool', () => {
       if (result.status === 'error') {
         expect((result.error as Error).message).toContain('terminated');
       }
+    });
+
+    it('returns false and does nothing when the job is not running', async () => {
+      pool = new ThreadPool({ maxThreads: 2 });
+
+      const found = await pool.terminate(999999);
+
+      expect(found).toBe(false);
+    });
+
+    it('resolves the pending execution with a caller-supplied result', async () => {
+      pool = new ThreadPool({ maxThreads: 2 });
+
+      const job = createSerializableJob({
+        args: { action: 'delay', delay: 10000 }
+      });
+      const options = createIsolationOptions();
+
+      const executePromise = pool.execute(job, options, 30000);
+      await new Promise(resolve => setTimeout(resolve, 50));
+
+      await pool.terminate(job.id, { status: 'cancel', reason: 'Job cancelled' });
+
+      const result = await executePromise;
+      expect(result).toEqual({ status: 'cancel', reason: 'Job cancelled' });
+    });
+
+    it('frees the slot immediately so a queued job is handed a thread without waiting on the exit event', async () => {
+      pool = new ThreadPool({ maxThreads: 1 });
+      const options = createIsolationOptions();
+
+      const blocker = createSerializableJob({ id: 1, args: { action: 'delay', delay: 10000 } });
+      const blocked = pool.execute(blocker, options, 30000);
+
+      await waitFor(() => pool.getStats().busyWorkers === 1, { describe: 'the pool to be busy' });
+
+      const queuedJob = createSerializableJob({ id: 2, args: { action: 'success' } });
+      const queued = pool.execute(queuedJob, options, 10000);
+
+      // Give the second execute() call a moment to actually enqueue as a
+      // waiter before terminating the first job.
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      await pool.terminate(blocker.id);
+
+      const queuedResult = await queued;
+      expect(queuedResult.status).toBe('ok');
+
+      await blocked;
+    });
+
+    it('keeps the pool healthy after termination: a replacement thread serves the next job', async () => {
+      pool = new ThreadPool({ maxThreads: 1 });
+      const options = createIsolationOptions();
+
+      const job = createSerializableJob({ args: { action: 'delay', delay: 10000 } });
+      const executePromise = pool.execute(job, options, 30000);
+      await waitFor(() => pool.getStats().busyWorkers === 1, { describe: 'the pool to be busy' });
+
+      await pool.terminate(job.id);
+      await executePromise;
+
+      const nextJob = createSerializableJob({ args: { action: 'success' } });
+      const nextResult = await pool.execute(nextJob, options, 5000);
+
+      expect(nextResult.status).toBe('ok');
+      expect(pool.getStats().totalWorkers).toBe(1);
     });
   });
 

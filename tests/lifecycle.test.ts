@@ -182,6 +182,106 @@ describe('job lifecycle', () => {
     });
   });
 
+  describe('cooperative cancellation', () => {
+    it('aborts a running worker promptly on cancelJob and settles it cancelled with no error bookkeeping', async () => {
+      let sawAbort = false;
+      let performCalls = 0;
+
+      const queue = queueWith(
+        defineWorker('abortable', async (_job, { signal }) => {
+          performCalls++;
+          return new Promise<never>((_, reject) => {
+            signal.addEventListener('abort', () => {
+              sawAbort = true;
+              const abortError = new Error('The operation was aborted');
+              abortError.name = 'AbortError';
+              reject(abortError);
+            });
+          });
+        })
+      );
+
+      await queue.start();
+      const job = await queue.insert('abortable', { args: {} });
+
+      await waitFor(
+        async () => (await queue.getJob(job.id))?.state === 'executing',
+        { describe: 'the job to start executing' }
+      );
+
+      const cancelled = await queue.cancelJob(job.id);
+      expect(cancelled).toBe(true);
+
+      const final = await waitFor(
+        async () => {
+          if (!sawAbort) return null;
+          const current = await queue.getJob(job.id);
+          return current?.state === 'cancelled' ? current : null;
+        },
+        { describe: 'the aborted job to settle cancelled' }
+      );
+      await queue.stop();
+
+      expect(sawAbort).toBe(true);
+      expect(performCalls).toBe(1);
+      expect(final?.state).toBe('cancelled');
+      // The AbortError thrown by the worker must not be recorded as a job
+      // failure: no error entry, and the attempt fetch already consumed is
+      // the only one spent.
+      expect(final?.errors).toHaveLength(0);
+      expect(final?.attempt).toBe(1);
+    }, 20000);
+
+    it('still lets a legacy single-argument worker be cancelled the old way (no signal, guard-based)', async () => {
+      let started = false;
+
+      const queue = queueWith(
+        // No context parameter at all -- unaffected by cancellation, keeps
+        // running to completion; the #35 guard is what stops it resurrecting
+        // the job.
+        defineWorker('legacy-slow', async () => {
+          started = true;
+          await new Promise(resolve => setTimeout(resolve, 300));
+          return WorkerResults.ok();
+        })
+      );
+
+      await queue.start();
+      const job = await queue.insert('legacy-slow', { args: {} });
+
+      await waitFor(() => started, { describe: 'the legacy worker to start' });
+
+      const cancelled = await queue.cancelJob(job.id);
+      expect(cancelled).toBe(true);
+      expect((await queue.getJob(job.id))?.state).toBe('cancelled');
+
+      const final = await waitFor(
+        async () => {
+          const current = await queue.getJob(job.id);
+          return current?.state === 'cancelled' ? current : null;
+        },
+        { describe: 'the job to remain cancelled once the legacy worker finishes' }
+      );
+      await queue.stop();
+
+      expect(final?.state).toBe('cancelled');
+    }, 20000);
+
+    it('cancelling a non-executing job behaves as before', async () => {
+      const queue = queueWith(defineWorker('noop', async () => WorkerResults.ok()));
+      await queue.start();
+
+      const job = await queue.insert('noop', { args: {} });
+      // Don't let the poller pick it up.
+      await queue.stop();
+
+      const cancelled = await queue.cancelJob(job.id);
+
+      expect(cancelled).toBe(true);
+      expect((await queue.getJob(job.id))?.state).toBe('cancelled');
+    }, 20000);
+  });
+
   describe('cancel and retry', () => {
     it('cancels a single job by id', async () => {
       const queue = queueWith();

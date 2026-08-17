@@ -341,12 +341,28 @@ export class IziQueue {
 
   async cancelJobs(criteria: JobCriteria): Promise<number> {
     assertScoped(criteria, 'cancelJobs');
-    return this.config.database.cancelJobs(criteria);
+    const count = await this.config.database.cancelJobs(criteria);
+
+    // Best-effort local interruption, only possible when the caller told us
+    // which ids were targeted. `cancelJobs` reports how many rows it
+    // changed, not which ones, so a queue/worker/state-scoped call has no
+    // way to know which jobs to interrupt without an extra query -- out of
+    // scope here. Every queue on this node is asked regardless of which one
+    // (if any) actually has the job; each is a no-op unless it does.
+    if (count > 0 && criteria.ids && criteria.ids.length > 0) {
+      await Promise.all(
+        criteria.ids.flatMap(id =>
+          Array.from(this.queues.values()).map(queue => queue.cancelRunning(id))
+        )
+      );
+    }
+
+    return count;
   }
 
   /** Cancels one job. Returns false if it was already in a terminal state. */
   async cancelJob(id: number): Promise<boolean> {
-    return (await this.config.database.cancelJobs({ ids: [id] })) > 0;
+    return (await this.cancelJobs({ ids: [id] })) > 0;
   }
 
   /**

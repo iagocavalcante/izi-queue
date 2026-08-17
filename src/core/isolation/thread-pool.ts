@@ -411,27 +411,44 @@ export class ThreadPool {
     });
   }
 
-  async terminate(jobId: number): Promise<void> {
+  /**
+   * Pre-emptively kills the worker thread running `jobId`, if one is found.
+   * `result` is what the job's pending `execute()` promise resolves with --
+   * defaults to the same "terminated" error it always has, for callers (the
+   * shutdown grace-period timeout) unrelated to cancellation.
+   *
+   * Node gives worker threads no graceful pre-kill notice: `terminate()` is
+   * a hard stop, so there is no way to let an isolated job's own code react
+   * before its thread dies. That is why isolated cancellation is pre-emptive
+   * rather than cooperative like the in-process `AbortSignal` path.
+   *
+   * Returns whether a thread running that job was found and killed. Frees
+   * the slot immediately (`handOffToWaiter`) rather than waiting on the
+   * worker's `exit` event, so a waiter queued behind a saturated pool is not
+   * left stuck for however long the OS takes to actually tear the thread
+   * down.
+   */
+  async terminate(
+    jobId: number,
+    result: WorkerResult = { status: 'error', error: new Error('Job terminated') }
+  ): Promise<boolean> {
     for (const pooled of this.workers) {
       if (pooled.currentJobId === jobId) {
         const pending = this.pendingJobs.get(jobId);
         if (pending) {
           clearTimeout(pending.timeoutId);
           this.pendingJobs.delete(jobId);
-          pending.resolve({
-            status: 'error',
-            error: new Error('Job terminated')
-          });
+          pending.resolve(result);
         }
 
+        pooled.currentJobId = null;
         this.terminateWorker(pooled);
-        const index = this.workers.indexOf(pooled);
-        if (index !== -1) {
-          this.workers.splice(index, 1);
-        }
-        return;
+        this.removeWorker(pooled);
+        this.handOffToWaiter();
+        return true;
       }
     }
+    return false;
   }
 
   async shutdown(): Promise<void> {

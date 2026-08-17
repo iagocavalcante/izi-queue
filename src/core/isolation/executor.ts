@@ -56,10 +56,12 @@ export async function executeIsolated(
   return threadPool!.execute(serializedJob, options, timeout);
 }
 
-export async function terminateIsolatedJob(jobId: number): Promise<void> {
-  if (threadPool) {
-    await threadPool.terminate(jobId);
-  }
+export async function terminateIsolatedJob(
+  jobId: number,
+  result?: WorkerResult
+): Promise<boolean> {
+  if (!threadPool) return false;
+  return threadPool.terminate(jobId, result);
 }
 
 export async function shutdownIsolation(): Promise<void> {

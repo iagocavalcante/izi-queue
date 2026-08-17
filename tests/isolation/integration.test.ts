@@ -9,6 +9,7 @@ import {
 } from '../../src/index.js';
 import { createSQLiteAdapter } from '../../src/database/sqlite.js';
 import type { Job } from '../../src/types.js';
+import { waitFor } from '../helpers/wait.js';
 
 const TEST_WORKER_PATH = join(__dirname, '../fixtures/test-isolated-worker.js');
 
@@ -348,5 +349,71 @@ describe('Isolated Workers Integration', () => {
 
     // Shutdown should complete despite running job (grace period will force termination)
     await expect(queue.shutdown()).resolves.not.toThrow();
+  });
+
+  describe('cancelling a running isolated job', () => {
+    it('pre-emptively terminates the thread, settles the job cancelled, and leaves the pool healthy', async () => {
+      const longWorker = defineWorker('LongIsolatedWorker', async () => WorkerResults.ok(), {
+        queue: 'default',
+        isolation: {
+          isolated: true,
+          workerPath: TEST_WORKER_PATH
+        }
+      });
+
+      const queue = createIziQueue({
+        database: db,
+        queues: { default: 5 },
+        pollInterval: 50,
+        isolation: { maxThreads: 2 }
+      });
+
+      queue.register(longWorker);
+      await queue.start();
+
+      const job = await queue.insert(longWorker, {
+        args: { action: 'delay', delay: 10000 }
+      });
+
+      await waitFor(
+        async () => (await queue.getJob(job.id))?.state === 'executing',
+        { describe: 'the isolated job to start executing' }
+      );
+      await waitFor(
+        () => (queue.getIsolationStats()?.busyWorkers ?? 0) > 0,
+        { describe: 'the worker thread to pick up the job' }
+      );
+
+      const cancelled = await queue.cancelJob(job.id);
+      expect(cancelled).toBe(true);
+
+      // Pre-emptive: the job must settle promptly, not after the 10s delay
+      // it asked for.
+      const final = await waitFor(
+        async () => {
+          const current = await queue.getJob(job.id);
+          return current?.state === 'cancelled' ? current : null;
+        },
+        { describe: 'the terminated isolated job to settle cancelled', timeout: 3000 }
+      );
+
+      expect(final?.state).toBe('cancelled');
+      // Terminating it must not have burned a retry or recorded a failure --
+      // it settles on the direct DB cancellation, not on the thread's result.
+      expect(final?.errors).toHaveLength(0);
+
+      // The pool must stay healthy: no leaked slot, capacity for a fresh job.
+      const healthy = await queue.insert(longWorker, { args: { action: 'success' } });
+      const healthyFinal = await waitFor(
+        async () => {
+          const current = await queue.getJob(healthy.id);
+          return current?.state === 'completed' ? current : null;
+        },
+        { describe: 'a fresh isolated job to complete after termination' }
+      );
+      expect(healthyFinal?.state).toBe('completed');
+
+      await queue.shutdown();
+    }, 20000);
   });
 });

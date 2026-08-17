@@ -473,6 +473,51 @@ describe('Queue Class', () => {
     });
   });
 
+  describe('cancelRunning', () => {
+    it('returns false for a job that is not executing on this queue', async () => {
+      const config = createQueueConfig({ name: 'default', pollInterval: 50 });
+      const queue = new Queue(config, adapter, 'node-1');
+
+      expect(await queue.cancelRunning(999999)).toBe(false);
+    });
+
+    it('fires the AbortSignal of an in-process job currently executing', async () => {
+      let seenSignal: AbortSignal | undefined;
+      let sawAbort = false;
+
+      registerWorker({
+        name: 'AbortableQueueWorker',
+        perform: async (_job, { signal }) => {
+          seenSignal = signal;
+          return new Promise<never>((_, reject) => {
+            signal.addEventListener('abort', () => {
+              sawAbort = true;
+              reject(new Error('AbortError'));
+            });
+          });
+        }
+      });
+
+      const config = createQueueConfig({ name: 'default', pollInterval: 50 });
+      const queue = new Queue(config, adapter, 'node-1');
+      const inserted = await adapter.insertJob(createJobData({ worker: 'AbortableQueueWorker' }));
+
+      await queue.start();
+      await waitFor(
+        async () => (await adapter.getJob(inserted.id))?.state === 'executing',
+        { describe: 'the job to start executing' }
+      );
+
+      const found = await queue.cancelRunning(inserted.id);
+      expect(found).toBe(true);
+
+      await waitFor(() => sawAbort, { describe: 'the worker to observe the abort' });
+      expect(seenSignal?.aborted).toBe(true);
+
+      await queue.stop();
+    });
+  });
+
   describe('concurrency', () => {
     it('should respect concurrency limit', async () => {
       let concurrent = 0;
