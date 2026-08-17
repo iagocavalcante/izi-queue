@@ -1,7 +1,8 @@
-import type { DatabaseAdapter, DrainOutcome, Job, QueueConfig } from '../types.js';
+import type { DatabaseAdapter, DrainOutcome, Job, Logger, QueueConfig } from '../types.js';
 import { formatError, sourceStatesFor } from './job.js';
 import { executeWorker, getBackoffDelay, hasWorker, getWorker, terminateIsolatedJob } from './worker.js';
 import { telemetry } from './telemetry.js';
+import { consoleLogger } from './logger.js';
 
 type QueueState = 'running' | 'paused' | 'stopped';
 
@@ -15,11 +16,13 @@ export class Queue {
   private polling = false;
   private pollInFlight?: Promise<void>;
   private node: string;
+  private logger: Logger;
 
-  constructor(config: QueueConfig, database: DatabaseAdapter, node: string) {
+  constructor(config: QueueConfig, database: DatabaseAdapter, node: string, logger: Logger = consoleLogger) {
     this.config = config;
     this.database = database;
     this.node = node;
+    this.logger = logger;
   }
 
   get name(): string {
@@ -203,7 +206,9 @@ export class Queue {
         promise.finally(() => this.running.delete(job.id));
       }
     } catch (error) {
-      console.error(`[izi-queue] Error fetching jobs for queue "${this.name}":`, error);
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.logger.error(`Error fetching jobs for queue "${this.name}"`, { error: err, queue: this.name });
+      telemetry.emit('queue:fetch_error', { queue: this.name, error: err });
     }
   }
 
@@ -216,7 +221,7 @@ export class Queue {
       // returns it to the queue once this node stops heartbeating. What must
       // not happen is rejecting: nothing awaits this promise, so it would
       // surface as an unhandled rejection and take the process down.
-      console.error(`[izi-queue] Failed to record outcome for job ${job.id}:`, error);
+      this.logger.error(`Failed to record outcome for job ${job.id}`, { error, jobId: job.id, queue: this.name });
     }
   }
 

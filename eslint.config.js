@@ -24,7 +24,16 @@ export default tseslint.config(
       '@typescript-eslint/explicit-function-return-type': 'off',
       '@typescript-eslint/no-explicit-any': 'warn',
       '@typescript-eslint/no-non-null-assertion': 'warn',
-      'no-console': ['warn', { allow: ['error', 'warn'] }],
+      'no-console': 'error',
+    },
+  },
+  {
+    // The one sanctioned place allowed to call console.* directly -- the
+    // default Logger implementation every other call site routes through
+    // instead. See src/core/logger.ts.
+    files: ['src/core/logger.ts'],
+    rules: {
+      'no-console': 'off',
     },
   }
 );

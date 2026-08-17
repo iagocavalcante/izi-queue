@@ -181,4 +181,30 @@ describe('Telemetry', () => {
       );
     });
   });
+
+  describe('queue:stage_error and queue:fetch_error (#40)', () => {
+    it('should deliver queue:stage_error with its error payload', () => {
+      const handler = jest.fn();
+      telemetry.on('queue:stage_error', handler);
+
+      const error = new Error('staging failed');
+      telemetry.emit('queue:stage_error', { error });
+
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'queue:stage_error', error })
+      );
+    });
+
+    it('should deliver queue:fetch_error with its queue and error payload', () => {
+      const handler = jest.fn();
+      telemetry.on('queue:fetch_error', handler);
+
+      const error = new Error('fetch failed');
+      telemetry.emit('queue:fetch_error', { queue: 'default', error });
+
+      expect(handler).toHaveBeenCalledWith(
+        expect.objectContaining({ event: 'queue:fetch_error', queue: 'default', error })
+      );
+    });
+  });
 });

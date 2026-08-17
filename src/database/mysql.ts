@@ -23,7 +23,7 @@ interface Pool {
   getConnection(): Promise<PoolConnection>;
   end(): Promise<void>;
 }
-import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
+import type { Job, JobCriteria, JobState, Logger, TransactionHandle, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 
@@ -34,8 +34,8 @@ import { mysqlMigrations } from './migrations.js';
 export class MySQLAdapter extends BaseAdapter {
   private pool: Pool;
 
-  constructor(pool: Pool) {
-    super();
+  constructor(pool: Pool, logger?: Logger) {
+    super(logger);
     this.pool = pool;
   }
 
@@ -67,7 +67,10 @@ export class MySQLAdapter extends BaseAdapter {
     for (const migration of mysqlMigrations) {
       if (appliedVersions.has(migration.version)) continue;
 
-      console.warn(`[izi-queue] Applying migration ${migration.version}: ${migration.name}`);
+      // Unified with the Postgres/SQLite adapters at info level; this was
+      // console.warn before #40, which was inconsistent with the other two
+      // dialects for the same non-warning progress message.
+      this.logger.info('Applying migration', { version: migration.version, name: migration.name });
 
       // DDL is not transactional in MySQL, so a failure part-way leaves the
       // schema changed but the version unrecorded. The lock at least stops two
@@ -92,7 +95,7 @@ export class MySQLAdapter extends BaseAdapter {
     for (const row of rows) {
       const migration = mysqlMigrations.find(m => m.version === row.version);
       if (migration?.down) {
-        console.warn(`[izi-queue] Rolling back migration ${migration.version}: ${migration.name}`);
+        this.logger.info('Rolling back migration', { version: migration.version, name: migration.name });
 
         const connection = await this.pool.getConnection();
         try {
@@ -404,6 +407,6 @@ export class MySQLAdapter extends BaseAdapter {
   }
 }
 
-export function createMySQLAdapter(pool: Pool): MySQLAdapter {
-  return new MySQLAdapter(pool);
+export function createMySQLAdapter(pool: Pool, logger?: Logger): MySQLAdapter {
+  return new MySQLAdapter(pool, logger);
 }

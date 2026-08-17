@@ -8,7 +8,8 @@ import {
   createPrunerPlugin,
   clearWorkers
 } from '../src/index.js';
-import type { Job } from '../src/types.js';
+import { waitForEvent } from './helpers/wait.js';
+import type { Job, Logger } from '../src/types.js';
 
 describe('IziQueue Class', () => {
   let db: Database.Database;
@@ -832,6 +833,73 @@ describe('IziQueue Class', () => {
       const retrieved = await queue.getJob(job.id);
       expect(retrieved?.tags).toEqual(['urgent', 'customer-support']);
 
+      await queue.shutdown();
+    });
+  });
+
+  describe('logging', () => {
+    function createMockLogger(): Logger & {
+      debug: jest.Mock;
+      info: jest.Mock;
+      warn: jest.Mock;
+      error: jest.Mock;
+    } {
+      return {
+        debug: jest.fn(),
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn()
+      };
+    }
+
+    it('routes a staging failure through the injected logger and emits queue:stage_error, instead of only console.error', async () => {
+      const logger = createMockLogger();
+      const boom = new Error('staging exploded');
+      const stageSpy = jest.spyOn(adapter, 'stageJobs').mockRejectedValueOnce(boom);
+
+      const queue = createIziQueue({ database: adapter, queues: { default: 5 }, logger });
+
+      const eventPromise = waitForEvent('queue:stage_error');
+      await queue.drain();
+      const payload = await eventPromise;
+
+      expect(payload.error).toBe(boom);
+      expect(logger.error).toHaveBeenCalledWith('Error staging jobs', expect.objectContaining({ error: boom }));
+
+      stageSpy.mockRestore();
+    });
+
+    it('defaults to consoleLogger for a staging failure when no logger is supplied', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const boom = new Error('staging exploded');
+      const stageSpy = jest.spyOn(adapter, 'stageJobs').mockRejectedValueOnce(boom);
+
+      const queue = createIziQueue({ database: adapter, queues: { default: 5 } });
+
+      const eventPromise = waitForEvent('queue:stage_error');
+      await queue.drain();
+      await eventPromise;
+
+      expect(errorSpy).toHaveBeenCalledWith('[izi-queue] Error staging jobs', { error: boom });
+
+      stageSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it('routes a heartbeat failure through the injected logger instead of only console.error', async () => {
+      const logger = createMockLogger();
+      const boom = new Error('heartbeat exploded');
+      const heartbeatSpy = jest.spyOn(adapter, 'heartbeat').mockRejectedValueOnce(boom);
+
+      const queue = createIziQueue({ database: adapter, queues: { default: 5 }, logger });
+      await queue.start();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        'Error recording node heartbeat',
+        expect.objectContaining({ error: boom })
+      );
+
+      heartbeatSpy.mockRestore();
       await queue.shutdown();
     });
   });

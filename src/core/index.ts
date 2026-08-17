@@ -25,6 +25,7 @@ export {
   getIsolationStats
 } from './worker.js';
 export { telemetry } from './telemetry.js';
+export { consoleLogger } from './logger.js';
 export {
   ThreadPool,
   type ThreadPoolConfig,

@@ -1,5 +1,6 @@
-import type { DatabaseAdapter, Job, JobState } from '../types.js';
+import type { DatabaseAdapter, Job, JobState, Logger } from '../types.js';
 import { DEFAULT_UNIQUE_PERIOD, DEFAULT_UNIQUE_STATES } from '../core/unique.js';
+import { consoleLogger } from '../core/logger.js';
 
 /**
  * Seconds a node may go without a heartbeat before it is presumed dead and its
@@ -466,6 +467,17 @@ export function rowToJob(row: Record<string, unknown>): Job {
 }
 
 export abstract class BaseAdapter implements DatabaseAdapter {
+  /**
+   * Defaults to `consoleLogger`, independently of any logger the owning
+   * `IziQueue` may be given -- see the `logger` doc on `IziQueueConfig` for
+   * why the two are not linked automatically.
+   */
+  protected readonly logger: Logger;
+
+  constructor(logger: Logger = consoleLogger) {
+    this.logger = logger;
+  }
+
   abstract migrate(): Promise<void>;
   abstract insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job>;
   abstract fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]>;
