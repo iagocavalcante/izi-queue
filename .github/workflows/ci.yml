@@ -45,7 +45,7 @@ jobs:
           --health-retries 10
 
       mysql:
-        image: mysql:8
+        image: mysql:26
         env:
           MYSQL_ROOT_PASSWORD: izi
           MYSQL_DATABASE: izi
