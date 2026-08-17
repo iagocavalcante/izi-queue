@@ -8,6 +8,46 @@ import { DEFAULT_UNIQUE_PERIOD, DEFAULT_UNIQUE_STATES } from '../core/unique.js'
  */
 export const DEFAULT_NODE_TTL = 60;
 
+/**
+ * Default number of rows `pruneJobs`/`stageJobs` touch per statement. Both
+ * operations run in bounded batches rather than one unbounded, heavily-locking
+ * DELETE/UPDATE over the whole backlog -- see `runInBatches`.
+ */
+export const DEFAULT_BATCH_SIZE = 5000;
+
+/**
+ * Repeatedly calls `operation(limit)` -- which should perform at most `limit`
+ * rows of work and return how many it actually touched -- until a call
+ * touches fewer than `limit` rows, i.e. the backlog is exhausted. Yields to
+ * the event loop between calls so a large backlog is worked as many short
+ * statements instead of a single long-running one that locks the table for
+ * its entire duration.
+ */
+export async function runInBatches(
+  operation: (limit: number) => Promise<number>,
+  limit: number
+): Promise<number> {
+  // A non-positive or non-finite limit can never be exceeded by `affected`,
+  // which would otherwise turn the loop below into one that never stops:
+  // fail loudly instead of hanging with a runaway timer.
+  if (!Number.isFinite(limit) || limit <= 0) {
+    throw new Error(`runInBatches: limit must be a positive number, got ${limit}`);
+  }
+
+  let total = 0;
+
+  for (;;) {
+    const affected = await operation(limit);
+    total += affected;
+
+    if (affected < limit) return total;
+
+    // Give the event loop -- and any queue polling the same table -- a chance
+    // to run between batches instead of monopolizing it.
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+}
+
 export const SQL = {
   postgres: {
     createTable: `
@@ -69,15 +109,26 @@ export const SQL = {
       RETURNING *
     `,
     getJob: 'SELECT * FROM izi_jobs WHERE id = $1',
+    // Postgres has no issue reading the target table in a DELETE/UPDATE's own
+    // subquery (unlike MySQL), so a plain `id IN (SELECT ...)` is enough to
+    // bound the statement to one batch.
     pruneJobs: `
       DELETE FROM izi_jobs
-      WHERE state IN ('completed', 'discarded', 'cancelled')
-        AND COALESCE(completed_at, discarded_at, cancelled_at) < NOW() - INTERVAL '1 second' * $1
+      WHERE id IN (
+        SELECT id FROM izi_jobs
+        WHERE state IN ('completed', 'discarded', 'cancelled')
+          AND COALESCE(completed_at, discarded_at, cancelled_at) < NOW() - INTERVAL '1 second' * $1
+        LIMIT $2
+      )
     `,
     stageJobs: `
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state IN ('scheduled', 'retryable') AND scheduled_at <= NOW()
+      WHERE id IN (
+        SELECT id FROM izi_jobs
+        WHERE state IN ('scheduled', 'retryable') AND scheduled_at <= NOW()
+        LIMIT $1
+      )
     `,
     cancelJobs: `
       UPDATE izi_jobs
@@ -167,15 +218,31 @@ export const SQL = {
       WHERE id = ?
     `,
     getJob: 'SELECT * FROM izi_jobs WHERE id = ?',
+    // MySQL raises ERROR 1093 ("You can't specify target table for update in
+    // FROM clause") for `DELETE ... WHERE id IN (SELECT id FROM same_table)`,
+    // so the inner SELECT must be wrapped in a derived table -- MySQL
+    // materializes that as a separate result set, which sidesteps the check.
     pruneJobs: `
       DELETE FROM izi_jobs
-      WHERE state IN ('completed', 'discarded', 'cancelled')
-        AND COALESCE(completed_at, discarded_at, cancelled_at) < DATE_SUB(NOW(), INTERVAL ? SECOND)
+      WHERE id IN (
+        SELECT id FROM (
+          SELECT id FROM izi_jobs
+          WHERE state IN ('completed', 'discarded', 'cancelled')
+            AND COALESCE(completed_at, discarded_at, cancelled_at) < DATE_SUB(NOW(), INTERVAL ? SECOND)
+          LIMIT ?
+        ) AS batch
+      )
     `,
     stageJobs: `
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state IN ('scheduled', 'retryable') AND scheduled_at <= NOW()
+      WHERE id IN (
+        SELECT id FROM (
+          SELECT id FROM izi_jobs
+          WHERE state IN ('scheduled', 'retryable') AND scheduled_at <= NOW()
+          LIMIT ?
+        ) AS batch
+      )
     `,
     cancelJobs: `
       UPDATE izi_jobs
@@ -266,15 +333,28 @@ export const SQL = {
       RETURNING *
     `,
     getJob: 'SELECT * FROM izi_jobs WHERE id = ?',
+    // SQLite's DELETE/UPDATE ... LIMIT syntax only works when the library was
+    // compiled with SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which better-sqlite3's
+    // bundled build is not. `id IN (SELECT ... LIMIT n)` bounds the batch with
+    // standard SQL instead; unlike MySQL, SQLite has no restriction against a
+    // DELETE/UPDATE's subquery reading the table being modified.
     pruneJobs: `
       DELETE FROM izi_jobs
-      WHERE state IN ('completed', 'discarded', 'cancelled')
-        AND datetime(COALESCE(completed_at, discarded_at, cancelled_at)) < datetime('now', '-' || ? || ' seconds')
+      WHERE id IN (
+        SELECT id FROM izi_jobs
+        WHERE state IN ('completed', 'discarded', 'cancelled')
+          AND datetime(COALESCE(completed_at, discarded_at, cancelled_at)) < datetime('now', '-' || ? || ' seconds')
+        LIMIT ?
+      )
     `,
     stageJobs: `
       UPDATE izi_jobs
       SET state = 'available'
-      WHERE state IN ('scheduled', 'retryable') AND datetime(scheduled_at) <= datetime('now')
+      WHERE id IN (
+        SELECT id FROM izi_jobs
+        WHERE state IN ('scheduled', 'retryable') AND datetime(scheduled_at) <= datetime('now')
+        LIMIT ?
+      )
     `,
     cancelJobs: `
       UPDATE izi_jobs
@@ -391,8 +471,8 @@ export abstract class BaseAdapter implements DatabaseAdapter {
   abstract fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]>;
   abstract updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[]): Promise<Job | null>;
   abstract getJob(id: number): Promise<Job | null>;
-  abstract pruneJobs(maxAge: number): Promise<number>;
-  abstract stageJobs(): Promise<number>;
+  abstract pruneJobs(maxAge: number, limit?: number): Promise<number>;
+  abstract stageJobs(limit?: number): Promise<number>;
   abstract cancelJobs(criteria: import('../types.js').JobCriteria): Promise<number>;
   abstract rescueStuckJobs(rescueAfter: number, nodeTtl?: number): Promise<number>;
 

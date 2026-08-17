@@ -134,6 +134,26 @@ describeMySQL('MySQLAdapter', () => {
     expect(await countByState()).toEqual({ available: 2, retryable: 1 });
   });
 
+  it('stages at most `limit` rows per call, leaving the rest for the next batch', async () => {
+    for (let i = 0; i < 12; i++) {
+      await pool.query(
+        `INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, scheduled_at)
+         VALUES ('scheduled', 'default', 'W', '{}', '{}', '[]', '[]', NOW() - INTERVAL 1 MINUTE)`
+      );
+    }
+    await pool.query(
+      `INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, scheduled_at)
+       VALUES ('scheduled', 'default', 'FutureW', '{}', '{}', '[]', '[]', NOW() + INTERVAL 1 HOUR)`
+    );
+
+    expect(await adapter.stageJobs(5)).toBe(5);
+    expect(await adapter.stageJobs(5)).toBe(5);
+    expect(await adapter.stageJobs(5)).toBe(2);
+    expect(await adapter.stageJobs(5)).toBe(0);
+
+    expect(await countByState()).toEqual({ available: 12, scheduled: 1 });
+  });
+
   it('updates a job and preserves untouched columns', async () => {
     const job = await adapter.insertJob(jobData({ args: { keep: true } }));
 
@@ -226,6 +246,23 @@ describeMySQL('MySQLAdapter', () => {
     const pruned = await adapter.pruneJobs(3600);
 
     expect(pruned).toBe(1);
+    expect(await countByState()).toEqual({ available: 1 });
+  });
+
+  it('deletes at most `limit` rows per call, leaving the rest for the next batch', async () => {
+    for (let i = 0; i < 12; i++) {
+      await pool.query(
+        `INSERT INTO izi_jobs (state, queue, worker, args, meta, tags, errors, completed_at)
+         VALUES ('completed', 'default', 'W', '{}', '{}', '[]', '[]', NOW() - INTERVAL 2 HOUR)`
+      );
+    }
+    await adapter.insertJob(jobData());
+
+    expect(await adapter.pruneJobs(3600, 5)).toBe(5);
+    expect(await adapter.pruneJobs(3600, 5)).toBe(5);
+    expect(await adapter.pruneJobs(3600, 5)).toBe(2);
+    expect(await adapter.pruneJobs(3600, 5)).toBe(0);
+
     expect(await countByState()).toEqual({ available: 1 });
   });
 

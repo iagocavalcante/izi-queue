@@ -24,7 +24,7 @@ interface Pool {
   end(): Promise<void>;
 }
 import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
-import { BaseAdapter, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
+import { BaseAdapter, DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 
 /** Arbitrary but fixed: all izi-queue instances must agree on this value. */
@@ -252,13 +252,13 @@ export class MySQLAdapter extends BaseAdapter {
     return rows[0] ? rowToJob(rows[0] as Record<string, unknown>) : null;
   }
 
-  async pruneJobs(maxAge: number): Promise<number> {
-    const [result] = await this.pool.query<ResultSetHeader>(SQL.mysql.pruneJobs, [maxAge]);
+  async pruneJobs(maxAge: number, limit: number = DEFAULT_BATCH_SIZE): Promise<number> {
+    const [result] = await this.pool.query<ResultSetHeader>(SQL.mysql.pruneJobs, [maxAge, limit]);
     return result.affectedRows;
   }
 
-  async stageJobs(): Promise<number> {
-    const [result] = await this.pool.query<ResultSetHeader>(SQL.mysql.stageJobs);
+  async stageJobs(limit: number = DEFAULT_BATCH_SIZE): Promise<number> {
+    const [result] = await this.pool.query<ResultSetHeader>(SQL.mysql.stageJobs, [limit]);
     return result.affectedRows;
   }
 

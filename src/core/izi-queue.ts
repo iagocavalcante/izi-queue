@@ -26,7 +26,7 @@ import {
   getIsolationStats
 } from './worker.js';
 import { randomUUID } from 'crypto';
-import { DEFAULT_NODE_TTL } from '../database/adapter.js';
+import { DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, runInBatches } from '../database/adapter.js';
 
 export interface IziQueueFullConfig extends IziQueueConfig {
   plugins?: Plugin[];
@@ -85,6 +85,7 @@ export class IziQueue {
       plugins: config.plugins ?? [],
       node: config.node ?? `node-${randomUUID().slice(0, 8)}`,
       stageInterval: config.stageInterval ?? 1000,
+      stageBatchSize: config.stageBatchSize ?? DEFAULT_BATCH_SIZE,
       shutdownGracePeriod: config.shutdownGracePeriod ?? 15000,
       heartbeatInterval: config.heartbeatInterval ?? 15000,
       pollInterval: config.pollInterval ?? 1000,
@@ -371,8 +372,17 @@ export class IziQueue {
     return (await this.retryJobs({ ids: [id] })) > 0;
   }
 
-  async pruneJobs(maxAgeSeconds = 86400 * 7): Promise<number> {
-    return this.config.database.pruneJobs(maxAgeSeconds);
+  /**
+   * Deletes every prunable job older than `maxAgeSeconds`. Runs in bounded
+   * batches of `batchSize` rows -- looping, and yielding to the event loop
+   * between batches -- rather than one unbounded DELETE that would lock the
+   * table for however long the whole backlog takes to scan.
+   */
+  async pruneJobs(maxAgeSeconds = 86400 * 7, batchSize = DEFAULT_BATCH_SIZE): Promise<number> {
+    return runInBatches(
+      limit => this.config.database.pruneJobs(maxAgeSeconds, limit),
+      batchSize
+    );
   }
 
   async rescueStuckJobs(rescueAfterSeconds = 300): Promise<number> {
@@ -428,7 +438,10 @@ export class IziQueue {
 
   private async stageJobs(): Promise<void> {
     try {
-      const staged = await this.config.database.stageJobs();
+      const staged = await runInBatches(
+        limit => this.config.database.stageJobs(limit),
+        this.config.stageBatchSize
+      );
       if (staged > 0) {
         this.queues.forEach(queue => queue.dispatch());
       }

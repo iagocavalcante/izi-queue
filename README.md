@@ -242,9 +242,12 @@ const queue = new IziQueue({
 not touch a job that is still running on a live node, so `rescueAfter` does not
 have to exceed your worker timeouts.
 
-**Pruner** deletes finished jobs. It currently deletes in one unbounded
-statement, so the first run against a large backlog is a long-running delete
-([#29](https://github.com/iagocavalcante/izi-queue/issues/29)).
+**Pruner** deletes finished jobs, at most `batchSize` rows per statement
+(default 5000), looping until the whole eligible backlog is cleared, rather
+than one unbounded DELETE that would lock the table for as long as a large
+backlog takes to scan. Staging (moving due `scheduled`/`retryable` jobs to
+`available`, which runs automatically -- no plugin needed) batches the same
+way; tune it with `stageBatchSize` on `IziQueue`'s config.
 
 > Every node runs every plugin: there is no leader election yet
 > ([#26](https://github.com/iagocavalcante/izi-queue/issues/26)). With several
