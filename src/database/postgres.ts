@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from 'pg';
-import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
+import type { Job, JobCriteria, JobState, Logger, TransactionHandle, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, SQL, criteriaClause, rowToJob } from './adapter.js';
 import { advisoryLockKey, computeUniqueKey } from '../core/unique.js';
 import { telemetry } from '../core/telemetry.js';
@@ -30,15 +30,15 @@ export class PostgresAdapter extends BaseAdapter {
   private maxReconnectAttempts = 10;
   private reconnectDelay = 1000;
 
-  constructor(pool: Pool) {
-    super();
+  constructor(pool: Pool, logger?: Logger) {
+    super(logger);
     this.pool = pool;
     this.setupErrorHandling();
   }
 
   private setupErrorHandling(): void {
     this.pool.on('error', (err) => {
-      console.error('[izi-queue] PostgreSQL pool error:', err.message);
+      this.logger.error('PostgreSQL pool error', { error: err.message });
       this.handleConnectionError();
     });
   }
@@ -49,11 +49,17 @@ export class PostgresAdapter extends BaseAdapter {
 
     while (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
-      console.log(`[izi-queue] Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+      // High-volume under a flapping connection -- debug rather than info so
+      // a console-backed logger stays quiet while a structured one can still
+      // capture every attempt.
+      this.logger.debug('Attempting to reconnect', {
+        attempt: this.reconnectAttempts,
+        maxAttempts: this.maxReconnectAttempts
+      });
 
       try {
         await this.pool.query('SELECT 1');
-        console.log('[izi-queue] Reconnected successfully');
+        this.logger.info('Reconnected successfully');
         this.reconnecting = false;
         this.reconnectAttempts = 0;
         return;
@@ -63,7 +69,9 @@ export class PostgresAdapter extends BaseAdapter {
       }
     }
 
-    console.error('[izi-queue] Failed to reconnect after maximum attempts');
+    this.logger.error('Failed to reconnect after maximum attempts', {
+      maxAttempts: this.maxReconnectAttempts
+    });
     this.reconnecting = false;
   }
 
@@ -96,7 +104,7 @@ export class PostgresAdapter extends BaseAdapter {
     for (const migration of postgresMigrations) {
       if (appliedVersions.has(migration.version)) continue;
 
-      console.log(`[izi-queue] Applying migration ${migration.version}: ${migration.name}`);
+      this.logger.info('Applying migration', { version: migration.version, name: migration.name });
 
       try {
         await client.query('BEGIN');
@@ -127,7 +135,7 @@ export class PostgresAdapter extends BaseAdapter {
     for (const row of result.rows) {
       const migration = postgresMigrations.find(m => m.version === row.version);
       if (migration?.down) {
-        console.log(`[izi-queue] Rolling back migration ${migration.version}: ${migration.name}`);
+        this.logger.info('Rolling back migration', { version: migration.version, name: migration.name });
 
         const client = await this.pool.connect();
         try {
@@ -473,6 +481,6 @@ export class PostgresAdapter extends BaseAdapter {
   }
 }
 
-export function createPostgresAdapter(pool: Pool): PostgresAdapter {
-  return new PostgresAdapter(pool);
+export function createPostgresAdapter(pool: Pool, logger?: Logger): PostgresAdapter {
+  return new PostgresAdapter(pool, logger);
 }

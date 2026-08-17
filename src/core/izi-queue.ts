@@ -17,6 +17,7 @@ import { createJob } from './job.js';
 import { computeUniqueKey } from './unique.js';
 import { Queue } from './queue.js';
 import { telemetry } from './telemetry.js';
+import { consoleLogger } from './logger.js';
 import {
   registerWorker,
   clearWorkers,
@@ -89,7 +90,8 @@ export class IziQueue {
       shutdownGracePeriod: config.shutdownGracePeriod ?? 15000,
       heartbeatInterval: config.heartbeatInterval ?? 15000,
       pollInterval: config.pollInterval ?? 1000,
-      isolation: config.isolation
+      isolation: config.isolation,
+      logger: config.logger ?? consoleLogger
     };
 
     if (this.config.isolation) {
@@ -148,7 +150,7 @@ export class IziQueue {
     );
 
     for (const queueConfig of this.config.queues) {
-      const queue = new Queue(queueConfig, this.config.database, this.config.node);
+      const queue = new Queue(queueConfig, this.config.database, this.config.node, this.config.logger);
       this.queues.set(queueConfig.name, queue);
     }
 
@@ -215,7 +217,7 @@ export class IziQueue {
     try {
       await this.config.database.heartbeat?.(this.config.node);
     } catch (error) {
-      console.error('[izi-queue] Error recording node heartbeat:', error);
+      this.config.logger.error('Error recording node heartbeat', { error, node: this.config.node });
     }
   }
 
@@ -223,7 +225,7 @@ export class IziQueue {
     try {
       await this.config.database.removeNode?.(this.config.node);
     } catch (error) {
-      console.error('[izi-queue] Error removing node record:', error);
+      this.config.logger.error('Error removing node record', { error, node: this.config.node });
     }
   }
 
@@ -446,7 +448,9 @@ export class IziQueue {
         this.queues.forEach(queue => queue.dispatch());
       }
     } catch (error) {
-      console.error('[izi-queue] Error staging jobs:', error);
+      const err = error instanceof Error ? error : new Error(String(error));
+      this.config.logger.error('Error staging jobs', { error: err });
+      telemetry.emit('queue:stage_error', { error: err });
     }
   }
 

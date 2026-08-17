@@ -1,3 +1,18 @@
+/**
+ * Structured logger izi-queue reports through instead of `console.*`. Message
+ * plus an optional metadata object -- shaped to pass straight through to
+ * pino, winston, or any logger with this same four-method surface. A default
+ * console-backed implementation (`consoleLogger`, in `src/core/logger.ts`) is
+ * used wherever a `logger` is not supplied, preserving izi-queue's prior
+ * behavior of writing everything to the console.
+ */
+export interface Logger {
+  debug(message: string, meta?: Record<string, unknown>): void;
+  info(message: string, meta?: Record<string, unknown>): void;
+  warn(message: string, meta?: Record<string, unknown>): void;
+  error(message: string, meta?: Record<string, unknown>): void;
+}
+
 export type JobState =
   | 'scheduled'
   | 'available'
@@ -321,6 +336,20 @@ export interface IziQueueConfig {
   heartbeatInterval?: number;
   pollInterval?: number;
   isolation?: IsolationConfig;
+  /**
+   * Where izi-queue reports its own operational logging (staging/fetch
+   * errors, node heartbeat failures, ...). Defaults to `consoleLogger`, which
+   * preserves the pre-#40 behavior of writing to `console.*`.
+   *
+   * This is independent of any `logger` passed to the database adapter's
+   * factory function (`createPostgresAdapter`, etc.) -- IziQueue does not
+   * propagate its logger down to the adapter. Adapters log on their own
+   * (connection errors, reconnect attempts, migrations) and can do so before
+   * an `IziQueue` even exists, e.g. via `adapter.migrate()` called directly.
+   * Pass the same `Logger` instance to both if you want adapter and
+   * queue-level logging routed through the same sink.
+   */
+  logger?: Logger;
 }
 
 export type TelemetryEvent =
@@ -341,6 +370,8 @@ export type TelemetryEvent =
   | 'queue:stop'
   | 'queue:pause'
   | 'queue:resume'
+  | 'queue:stage_error'
+  | 'queue:fetch_error'
   | 'thread:spawn'
   | 'thread:exit'
   | 'plugin:start'

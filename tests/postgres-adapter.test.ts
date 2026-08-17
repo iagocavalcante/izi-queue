@@ -2,7 +2,7 @@ import pg from 'pg';
 import { randomBytes } from 'crypto';
 import { waitFor } from './helpers/wait.js';
 import { createPostgresAdapter, PostgresAdapter } from '../src/database/postgres.js';
-import type { Job } from '../src/types.js';
+import type { Job, Logger } from '../src/types.js';
 
 /**
  * These tests need a real PostgreSQL server; the dialect differences that matter
@@ -498,5 +498,83 @@ describePostgres('PostgresAdapter', () => {
         await listenerAdapter.close().catch(() => {});
       }
     }, 40000);
+  });
+
+  describe('logging (#40)', () => {
+    function createMockLogger(): Logger & {
+      debug: jest.Mock;
+      info: jest.Mock;
+      warn: jest.Mock;
+      error: jest.Mock;
+    } {
+      return {
+        debug: jest.fn(),
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn()
+      };
+    }
+
+    it('routes migration progress through an injected logger instead of console.log', async () => {
+      await pool.query('DROP TABLE IF EXISTS izi_jobs, izi_nodes, izi_migrations');
+
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+      const logger = createMockLogger();
+      const migratePool = new pg.Pool({ connectionString: CONNECTION_STRING });
+
+      try {
+        await createPostgresAdapter(migratePool, logger).migrate();
+
+        expect(logger.info).toHaveBeenCalledWith(
+          'Applying migration',
+          expect.objectContaining({ version: expect.any(Number), name: expect.any(String) })
+        );
+        expect(logSpy).not.toHaveBeenCalled();
+      } finally {
+        await migratePool.end();
+        logSpy.mockRestore();
+      }
+    });
+
+    it('routes a pool error to logger.error, reconnect attempts to logger.debug, and recovery to logger.info', async () => {
+      const logger = createMockLogger();
+      const reconnectPool = new pg.Pool({ connectionString: CONNECTION_STRING });
+      // One adapter for the whole test: PostgresAdapter registers its pool
+      // 'error' listener in the constructor, so a second instance on the same
+      // pool would double up the handler and the assertions below.
+      const reconnectAdapter = createPostgresAdapter(reconnectPool, logger);
+      await reconnectAdapter.migrate();
+      logger.info.mockClear();
+
+      try {
+        // Simulates a dropped connection the way the underlying `pg` driver
+        // itself would report one -- the pool is otherwise healthy, so the
+        // adapter's first reconnect attempt succeeds immediately.
+        reconnectPool.emit('error', new Error('simulated connection loss'));
+
+        expect(logger.error).toHaveBeenCalledWith(
+          'PostgreSQL pool error',
+          expect.objectContaining({ error: 'simulated connection loss' })
+        );
+
+        await waitFor(() => logger.info.mock.calls.length > 0, {
+          describe: 'the reconnect to report success via logger.info',
+          timeout: 15000
+        });
+
+        expect(logger.debug).toHaveBeenCalledWith(
+          'Attempting to reconnect',
+          expect.objectContaining({ attempt: 1, maxAttempts: expect.any(Number) })
+        );
+        expect(logger.info).toHaveBeenCalledWith('Reconnected successfully');
+
+        // Reconnect-progress logging is debug-level so a console-backed
+        // logger stays quiet under repeated attempts; only the pool error and
+        // final outcome are console.error/console.log by default.
+        expect(logger.error).toHaveBeenCalledTimes(1);
+      } finally {
+        await reconnectPool.end();
+      }
+    }, 20000);
   });
 });

@@ -1,5 +1,5 @@
 import type { Database } from 'better-sqlite3';
-import type { Job, JobCriteria, JobState, TransactionHandle, UniqueOptions } from '../types.js';
+import type { Job, JobCriteria, JobState, Logger, TransactionHandle, UniqueOptions } from '../types.js';
 import { BaseAdapter, DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, criteriaClause, rowToJob } from './adapter.js';
 import { computeUniqueKey } from '../core/unique.js';
 import { sqliteMigrations } from './migrations.js';
@@ -7,8 +7,8 @@ import { sqliteMigrations } from './migrations.js';
 export class SQLiteAdapter extends BaseAdapter {
   private db: Database;
 
-  constructor(db: Database) {
-    super();
+  constructor(db: Database, logger?: Logger) {
+    super(logger);
     this.db = db;
   }
 
@@ -37,7 +37,7 @@ export class SQLiteAdapter extends BaseAdapter {
 
     for (const migration of sqliteMigrations) {
       if (!appliedVersions.has(migration.version)) {
-        console.log(`[izi-queue] Applying migration ${migration.version}: ${migration.name}`);
+        this.logger.info('Applying migration', { version: migration.version, name: migration.name });
         applyMigration(migration);
       }
     }
@@ -50,7 +50,7 @@ export class SQLiteAdapter extends BaseAdapter {
     const rollbackMigration = this.db.transaction((version: number) => {
       const migration = sqliteMigrations.find(m => m.version === version);
       if (migration?.down) {
-        console.log(`[izi-queue] Rolling back migration ${migration.version}: ${migration.name}`);
+        this.logger.info('Rolling back migration', { version: migration.version, name: migration.name });
         for (const statement of migration.down) {
           this.db.exec(statement);
         }
@@ -381,6 +381,6 @@ export class SQLiteAdapter extends BaseAdapter {
   }
 }
 
-export function createSQLiteAdapter(db: Database): SQLiteAdapter {
-  return new SQLiteAdapter(db);
+export function createSQLiteAdapter(db: Database, logger?: Logger): SQLiteAdapter {
+  return new SQLiteAdapter(db, logger);
 }

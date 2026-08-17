@@ -8,7 +8,7 @@ import {
   clearWorkers
 } from '../src/index.js';
 import { telemetry } from '../src/core/telemetry.js';
-import { waitFor } from './helpers/wait.js';
+import { waitFor, waitForEvent } from './helpers/wait.js';
 import type { QueueConfig, Job } from '../src/types.js';
 
 describe('Queue Class', () => {
@@ -646,6 +646,68 @@ describe('Queue Class', () => {
       if (jobTimer) clearTimeout(jobTimer);
       releaseJob?.();
       await waitFor(() => jobCompleted, { describe: 'the abandoned job to settle' });
+    });
+  });
+
+  describe('logging', () => {
+    function createMockLogger() {
+      return {
+        debug: jest.fn(),
+        info: jest.fn(),
+        warn: jest.fn(),
+        error: jest.fn()
+      };
+    }
+
+    it('routes a fetch failure through the injected logger and emits queue:fetch_error, instead of only console.error', async () => {
+      const logger = createMockLogger();
+      const config = createQueueConfig({ name: 'default', pollInterval: 10000 });
+      const queue = new Queue(config, adapter, 'node-1', logger);
+
+      const boom = new Error('connection reset');
+      const fetchSpy = jest.spyOn(adapter, 'fetchJobs').mockRejectedValueOnce(boom);
+
+      const eventPromise = waitForEvent('queue:fetch_error');
+
+      await queue.start();
+      queue.dispatch();
+
+      const payload = await eventPromise;
+      expect(payload.queue).toBe('default');
+      expect(payload.error).toBe(boom);
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining('Error fetching jobs for queue "default"'),
+        expect.objectContaining({ error: boom, queue: 'default' })
+      );
+
+      fetchSpy.mockRestore();
+      await queue.stop();
+    });
+
+    it('defaults to consoleLogger for a fetch failure when no logger is supplied', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const config = createQueueConfig({ name: 'default', pollInterval: 10000 });
+      const queue = new Queue(config, adapter, 'node-1');
+
+      const boom = new Error('connection reset');
+      const fetchSpy = jest.spyOn(adapter, 'fetchJobs').mockRejectedValueOnce(boom);
+
+      const eventPromise = waitForEvent('queue:fetch_error');
+
+      await queue.start();
+      queue.dispatch();
+
+      await eventPromise;
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Error fetching jobs for queue "default"'),
+        expect.objectContaining({ error: boom })
+      );
+
+      fetchSpy.mockRestore();
+      errorSpy.mockRestore();
+      await queue.stop();
     });
   });
 });
