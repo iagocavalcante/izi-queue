@@ -241,6 +241,93 @@ describe('Worker Module', () => {
         jest.useRealTimers();
       }
     });
+
+    it('still calls a legacy single-argument worker unchanged', async () => {
+      // No second parameter declared at all -- the pre-#30 signature. Passing
+      // the context object anyway must not affect it: JS silently ignores an
+      // extra call argument.
+      registerWorker({
+        name: 'LegacyWorker',
+        perform: async (job) => WorkerResults.ok({ args: job.args })
+      });
+
+      const job = createMockJob({ worker: 'LegacyWorker', args: { n: 1 } });
+      const result = await executeWorker(job);
+
+      expect(result.status).toBe('ok');
+      if (result.status === 'ok') {
+        expect(result.value).toEqual({ args: { n: 1 } });
+      }
+    });
+
+    it('passes an AbortSignal as the second argument to perform', async () => {
+      let seenSignal: AbortSignal | undefined;
+      registerWorker({
+        name: 'SignalWorker',
+        perform: async (_job, { signal }) => {
+          seenSignal = signal;
+          return WorkerResults.ok();
+        }
+      });
+
+      await executeWorker(createMockJob({ worker: 'SignalWorker' }));
+
+      expect(seenSignal).toBeInstanceOf(AbortSignal);
+      expect(seenSignal?.aborted).toBe(false);
+    });
+
+    it('fires the signal of an externally supplied AbortController', async () => {
+      const controller = new AbortController();
+      let seenAborted: boolean | undefined;
+
+      registerWorker({
+        name: 'AbortAwareWorker',
+        perform: async (_job, { signal }) => {
+          return new Promise<never>((_, reject) => {
+            signal.addEventListener('abort', () => {
+              seenAborted = signal.aborted;
+              reject(new Error('AbortError'));
+            });
+          });
+        }
+      });
+
+      const job = createMockJob({ worker: 'AbortAwareWorker' });
+      const pending = executeWorker(job, controller);
+      controller.abort(new Error('cancelled'));
+
+      const result = await pending;
+
+      expect(seenAborted).toBe(true);
+      expect(result.status).toBe('error');
+    });
+
+    it('aborts the signal when the job times out, so a cooperative worker stops too', async () => {
+      let sawAbort = false;
+      registerWorker({
+        name: 'TimeoutAwareWorker',
+        perform: async (_job, { signal }) => {
+          return new Promise<never>((_, reject) => {
+            const guard = setTimeout(() => reject(new Error('should not reach this')), 5000);
+            signal.addEventListener('abort', () => {
+              sawAbort = true;
+              clearTimeout(guard);
+              reject(new Error('AbortError'));
+            });
+          });
+        },
+        timeout: 30
+      });
+
+      const job = createMockJob({ worker: 'TimeoutAwareWorker' });
+      const result = await executeWorker(job);
+
+      expect(sawAbort).toBe(true);
+      expect(result.status).toBe('error');
+      if (result.status === 'error') {
+        expect((result.error as Error).message).toContain('timed out');
+      }
+    });
   });
 
   describe('WorkerResults', () => {

@@ -150,6 +150,22 @@ export type WorkerResult =
   | { status: 'snooze'; seconds: number };
 
 /**
+ * Passed as the second argument to `perform`. `signal` fires when the job is
+ * cancelled while executing on this node (via `cancelJob`/`cancelJobs`) or
+ * when the job's own timeout elapses. A worker that threads `signal` through
+ * to abortable operations (e.g. `fetch(url, { signal })`) stops promptly
+ * instead of running to completion for a result that will be discarded.
+ *
+ * Only available to in-process workers. Isolated (worker-thread) jobs cannot
+ * receive a live signal -- there is no way to hand a `AbortSignal` across the
+ * thread boundary and have it still fire -- so cancellation there is always
+ * pre-emptive thread termination instead; see `IsolatedWorkerOptions`.
+ */
+export interface WorkerContext {
+  signal: AbortSignal;
+}
+
+/**
  * How a single job resolved when executed inline by `IziQueue.drain()`.
  * `failure` is an error with retry budget left (the job becomes `retryable`);
  * `discarded` covers both an error with no attempts left and an unregistered
@@ -175,7 +191,11 @@ export interface IsolatedWorkerOptions {
 
 export interface WorkerDefinition<T = Record<string, unknown>> {
   name: string;
-  perform: (job: Job<T>) => Promise<WorkerResult | void>;
+  /**
+   * `context` is optional to accept: a worker that ignores it is unaffected
+   * by cooperative cancellation but otherwise keeps working unchanged.
+   */
+  perform: (job: Job<T>, context: WorkerContext) => Promise<WorkerResult | void>;
   queue?: string;
   maxAttempts?: number;
   priority?: number;

@@ -12,6 +12,7 @@ export class Queue {
   private state: QueueState = 'stopped';
   private running: Map<number, Promise<void>> = new Map();
   private isolatedJobs: Set<number> = new Set();
+  private abortControllers: Map<number, AbortController> = new Map();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private polling = false;
   private pollInFlight?: Promise<void>;
@@ -155,6 +156,46 @@ export class Queue {
   }
 
   /**
+   * Interrupts `jobId` if it is currently executing on this node: fires its
+   * `AbortSignal` for an in-process worker, or pre-emptively kills its
+   * worker thread for an isolated one. Returns whether the job was actually
+   * found running here.
+   *
+   * This is necessarily local. A job executing on another node cannot be
+   * reached from here -- there is no signal to fire and no thread to kill --
+   * so `IziQueue.cancelJob` calls this on every queue on every node's own
+   * `IziQueue` instance, and each one is a no-op except on the node that
+   * actually has the job. The database row is cancelled regardless (by the
+   * caller, before this runs); the #35 state-transition guard is what stops
+   * the other node's worker from resurrecting it once it finishes on its own.
+   * Building a cross-node "stop now" signal (e.g. over LISTEN/NOTIFY) is
+   * future work, not attempted here.
+   */
+  async cancelRunning(jobId: number): Promise<boolean> {
+    const controller = this.abortControllers.get(jobId);
+    if (controller) {
+      if (!controller.signal.aborted) {
+        controller.abort(new Error('Job cancelled'));
+      }
+      return true;
+    }
+
+    if (this.isolatedJobs.has(jobId)) {
+      // Only kills a thread already running the job. If the pool is
+      // saturated and the job is still queued waiting for one (added to
+      // `isolatedJobs` before that wait begins), `ThreadPool.terminate` finds
+      // nothing to kill and this is a no-op -- the job runs once a thread
+      // frees up, same as before this feature, and the state-transition
+      // guard still keeps it from resurrecting the cancelled row. Reaching
+      // into the pool's wait queue to pre-empt a not-yet-started job would
+      // need `Waiter` to carry a jobId; left as a follow-up.
+      return terminateIsolatedJob(jobId, { status: 'cancel', reason: 'Job cancelled' });
+    }
+
+    return false;
+  }
+
+  /**
    * Schedules the next poll, replacing any pending one.
    *
    * Always clearing first is what keeps a single poll loop per queue: `dispatch()`
@@ -241,12 +282,16 @@ export class Queue {
     const worker = getWorker(job.worker);
     const isIsolated = worker?.isolation?.isolated === true;
 
+    let controller: AbortController | undefined;
     if (isIsolated) {
       this.isolatedJobs.add(job.id);
+    } else {
+      controller = new AbortController();
+      this.abortControllers.set(job.id, controller);
     }
 
     try {
-      const result = await executeWorker(job);
+      const result = await executeWorker(job, controller);
       const duration = Date.now() - startTime;
 
       switch (result.status) {
@@ -274,6 +319,7 @@ export class Queue {
       );
     } finally {
       this.isolatedJobs.delete(job.id);
+      this.abortControllers.delete(job.id);
     }
   }
 
