@@ -433,6 +433,25 @@ const refused = waitForEvent('job:transition_refused');
 A fixed sleep bets the work finishes inside a window you guessed. That bet fails
 intermittently under load and makes every run pay the full duration regardless.
 
+### Regenerating package-lock.json
+
+Run `npm install` in a Linux container, not on macOS:
+
+```bash
+docker run --rm -v "$PWD":/w -w /w node:22 npm install --ignore-scripts
+```
+
+npm on macOS prunes the dependencies of optional platform packages it will
+never install, and `@napi-rs/wasm-runtime` -- reached through jest's
+`unrs-resolver` -- declares `@emnapi/core` and `@emnapi/runtime` as *peers*.
+Drop them from the tree and every `npm ci` on Linux fails the sync check with
+`Missing: @emnapi/core@... from lock file`, so a lock written on a Mac breaks
+all nine CI jobs while installing perfectly on the machine that wrote it.
+
+Prefer targeted `npm install <pkg>@<version>` over a blanket `npm update`; the
+latter drags optional transitive packages along and reshuffles that subtree for
+no reason.
+
 ### Running against real databases
 
 SQLite alone will not catch dialect bugs -- the priority-ordering and btree index

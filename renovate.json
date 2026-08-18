@@ -2,5 +2,23 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "better-sqlite3 13 requires Node >= 22, but the package supports Node >= 18 and CI runs the whole suite on 18 and 20. Holding the dev dependency at 12 keeps those jobs installable; 13 is still exercised by the peer-range matrix in ci.yml. Lift this when engines.node moves to >= 22.",
+      "matchDepNames": ["better-sqlite3"],
+      "matchDepTypes": ["devDependencies"],
+      "allowedVersions": "<13"
+    },
+    {
+      "description": "@types/node is pinned to the oldest supported Node line on purpose. Newer types would typecheck against APIs that do not exist on the Node 18 this package still claims to run on. Bump this together with engines.node.",
+      "matchDepNames": ["@types/node"],
+      "allowedVersions": "<21"
+    },
+    {
+      "description": "typescript-eslint declares a typescript peer range of >= 4.8.4 < 6.1.0, so TypeScript 7 cannot be installed without breaking the lint job. Lift this once typescript-eslint supports 7.",
+      "matchDepNames": ["typescript"],
+      "allowedVersions": "<7"
+    }
   ]
 }
