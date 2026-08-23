@@ -103,6 +103,11 @@ export class Peer {
     // does not have to wait out a full interval to find out whether it may.
     await this.elect();
 
+    // stop() may have run while that first election was in flight -- it had no
+    // timer to clear yet, so installing one now would leave an interval alive
+    // for the life of the process with nothing left to clear it.
+    if (!this.running) return;
+
     this.timer = setInterval(() => {
       void this.elect();
     }, this.interval);

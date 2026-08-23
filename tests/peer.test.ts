@@ -189,6 +189,9 @@ describe('Peer (leader election)', () => {
       await starting;
 
       expect(a.isLeader()).toBe(false);
+      // The renewal timer must not be installed after the fact either: nothing
+      // would ever clear it, and it would hold the process open forever.
+      expect((a as unknown as { timer?: unknown }).timer).toBeUndefined();
     });
   });
 
