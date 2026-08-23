@@ -114,7 +114,7 @@ Follow existing patterns in the codebase:
 
 - **Error Handling**: Catch and format errors, don't let them propagate unexpectedly
 
-See `CLAUDE.md` for detailed architecture patterns.
+See `AGENTS.md` for detailed architecture patterns.
 
 ## Testing
 
@@ -204,7 +204,8 @@ Include:
 
 1. Create adapter in `src/database/` extending the adapter pattern
 2. Implement the `DatabaseAdapter` interface
-3. Add tests in `tests/`
+3. Add tests in `tests/`, and run them against a real server of that dialect —
+   SQLite has hidden genuine defects in every other adapter
 4. Add factory function (`createXAdapter`)
 5. Export from `src/database/index.ts`
 
@@ -212,8 +213,12 @@ Include:
 
 1. Create plugin in `src/plugins/` extending `BasePlugin`
 2. Implement `onStart()` and optionally `onStop()`, `validate()`
-3. Add tests in `tests/plugins.test.ts`
-4. Export from `src/plugins/index.ts`
+3. Gate cluster-wide work on `this.isLeader()` — an ungated tick does its work
+   once per node, against the same rows
+4. Enqueue through `this.context.insert`, not `database.insertJob`, which skips
+   worker defaults, uniqueness and the queue wake-up
+5. Add tests in `tests/plugins.test.ts`
+6. Export from `src/plugins/index.ts`
 
 ### New Worker Feature
 

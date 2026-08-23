@@ -13,6 +13,8 @@ A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](ht
 - **No extra infrastructure** - Use your existing PostgreSQL, SQLite, or MySQL database
 - **Transactional** - Enqueue inside your own transaction, so a job never outlives the write it belongs to
 - **Durable** - Jobs live in your database, survive restarts, and are recovered when a node dies
+- **Scheduled** - Run jobs later, or on a cron schedule, without a separate scheduler
+- **Cluster-aware** - One elected node does the maintenance work, however many you run
 - **Simple API** - Define workers, insert jobs, done
 - **TypeScript-first** - Full type safety and excellent DX
 - **Battle-tested patterns** - Inspired by Oban's proven design
@@ -563,6 +565,10 @@ at boot — it holds an advisory lock, so concurrent starts do not collide.
 await queue.migrate();
 ```
 
+Three tables are created: `izi_jobs` (the queue), `izi_nodes` (node liveness,
+used to tell an abandoned job from a slow one) and `izi_peers` (the leadership
+lease).
+
 It applies DDL against `izi_jobs`, so on a large table review what a release
 adds before deploying. Each version's migrations are listed in
 [CHANGELOG.md](CHANGELOG.md).
@@ -669,7 +675,7 @@ npm run build
 ### Development Guidelines
 
 - Write tests for new features
-- Follow existing code patterns (see `CLAUDE.md` for architecture details)
+- Follow existing code patterns (see `AGENTS.md` for architecture details)
 - Run `npm run lint` before committing
 - Keep PRs focused and atomic
 
@@ -680,10 +686,11 @@ izi-queue follows these key architectural patterns:
 - **Registry Pattern** - Global worker registry for dynamic worker management
 - **Adapter Pattern** - Database adapters for multi-database support
 - **Plugin Architecture** - Extensible plugin system with lifecycle hooks
-- **State Machine** - Job state transitions with validation
+- **State Machine** - Job state transitions with validation, arbitrated by the database
+- **Leader Election** - A TTL lease in `izi_peers`, so maintenance runs once per cluster
 - **Observable Pattern** - Telemetry event system for monitoring
 
-For detailed architecture documentation, see [`CLAUDE.md`](CLAUDE.md).
+For detailed architecture documentation, see [`AGENTS.md`](AGENTS.md).
 
 ## Acknowledgments
 
