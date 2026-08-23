@@ -26,11 +26,35 @@ While the version is below 1.0.0, breaking changes are released as minor version
   still stages regardless of leadership. Set `leadership: false` for the old
   behavior; adapters that do not implement `acquireLeadership` get it
   automatically. ([#26])
+- **Cron plugin.** `CronPlugin({ crontab, timezone?, interval?,
+  maxCatchUpMinutes? })` runs jobs on a schedule, the equivalent of
+  `Oban.Plugins.Cron`. Standard five-field expressions with ranges, lists,
+  steps and names, plus the `@hourly`/`@daily`/`@midnight`/`@weekly`/
+  `@monthly`/`@yearly`/`@annually` aliases; per-entry `args`, `queue`,
+  `priority`, `maxAttempts`, `tags` and IANA `timezone`. Evaluation is
+  leader-only *and* every insert is unique on `(entry, minute)`, so a
+  leadership handover cannot duplicate a run and a fast-finishing job cannot
+  be reinserted by the next node to evaluate that minute. A tick delayed past
+  its minute catches up on what it skipped, bounded by `maxCatchUpMinutes`.
+  Invalid expressions and timezones are rejected when the queue is
+  constructed, naming the entry at fault. The parser is also exported on its
+  own as `parseCron`/`matchesCron`/`fieldsInTimezone`. No new dependencies.
+  ([#27])
+- **`unique.scope`**, an opaque discriminator folded into the uniqueness
+  digest, so two otherwise identical jobs are only "the same" within the same
+  scope -- a tenant, a billing period, a scheduled minute. Exact where a
+  `period` window is approximate. Digests computed without a scope are
+  unchanged, so unique jobs already in the database keep deduplicating.
 - `DatabaseAdapter.acquireLeadership`, `releaseLeadership` and `getLeader`,
   all optional so third-party adapters keep compiling.
 - `PluginContext.isLeader` and `BasePlugin.isLeader()`, for gating a custom
   plugin's cluster-wide work the way `LifelinePlugin` and `PrunerPlugin` now
   gate theirs.
+- `PluginContext.insert`, so a plugin can enqueue jobs through the owning
+  queue's own insert path -- worker defaults, uniqueness and queue wake-up
+  included -- rather than reaching past it to `database.insertJob`.
+- `PluginContext.logger` and `BasePlugin.log`, so a plugin reports through the
+  same sink as the rest of izi-queue instead of `console`.
 
 ### Changed
 
@@ -433,6 +457,7 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#34]: https://github.com/iagocavalcante/izi-queue/issues/34
 [#40]: https://github.com/iagocavalcante/izi-queue/issues/40
 [#26]: https://github.com/iagocavalcante/izi-queue/issues/26
+[#27]: https://github.com/iagocavalcante/izi-queue/issues/27
 [0.4.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.3.0...v0.4.0
 [0.4.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.0...v0.4.1
 [0.5.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.1...v0.5.0

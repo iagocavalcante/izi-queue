@@ -53,6 +53,12 @@ export function computeUniqueKey<T = Record<string, unknown>>(
   const fields = options.fields ?? DEFAULT_UNIQUE_FIELDS;
   const parts: Array<[string, unknown]> = [];
 
+  // Pushed only when given, so digests computed without a scope are byte-for-
+  // byte what they were before scopes existed.
+  if (options.scope !== undefined) {
+    parts.push(['scope', options.scope]);
+  }
+
   if (fields.includes('worker')) {
     parts.push(['worker', job.worker]);
   }

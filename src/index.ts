@@ -71,11 +71,20 @@ export {
   createLifelinePlugin,
   PrunerPlugin,
   createPrunerPlugin,
+  CronPlugin,
+  createCronPlugin,
+  parseCron,
+  matchesCron,
+  fieldsInTimezone,
   type Plugin,
   type PluginConfig,
   type PluginContext,
   type LifelineConfig,
-  type PrunerConfig
+  type PrunerConfig,
+  type CronConfig,
+  type CronEntry,
+  type CronSchedule,
+  type CronFields
 } from './plugins/index.js';
 
 // Types

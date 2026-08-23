@@ -47,7 +47,9 @@ src/
     ├── index.ts
     ├── plugin.ts         # BasePlugin abstract class
     ├── lifeline.ts       # Rescue stuck jobs
-    └── pruner.ts         # Cleanup old jobs
+    ├── pruner.ts         # Cleanup old jobs
+    ├── cron.ts           # Scheduled jobs
+    └── cron-expression.ts # Cron parsing & timezone evaluation
 
 tests/
 ├── *.test.ts             # Unit tests
@@ -561,8 +563,26 @@ Jobs ordered by: `priority ASC, scheduled_at ASC`
 1. Create `src/plugins/myplugin.ts`
 2. Extend `BasePlugin`
 3. Implement `onStart()` with your interval logic
-4. Export from `src/plugins/index.ts`
-5. Add tests in `tests/plugins.test.ts`
+4. Gate any cluster-wide work on `this.isLeader()`
+5. Enqueue through `this.context.insert`, never `database.insertJob` --
+   the latter skips worker defaults, uniqueness and the queue wake-up
+6. Export from `src/plugins/index.ts`
+7. Add tests in `tests/plugins.test.ts`
+
+### Scheduling correctness (cron)
+
+Two mechanisms, and both are load-bearing:
+
+- **Leader-only evaluation** stops N nodes from evaluating the crontab N times.
+- **A unique key scoped to `(entry, minute)`** is what makes it *correct*, since
+  a leadership handover can legitimately have two nodes evaluate the same
+  minute. It spans every job state and uses no period window: a cron job that
+  completes in 10ms would otherwise be reinserted by the next node to look at
+  that minute, and a time-window guard cannot separate two runs a minute apart
+  that land milliseconds apart in wall-clock terms.
+
+Test schedules with `jest.useFakeTimers({ now })` and `jest.setSystemTime`.
+Stubbing `Date.now` directly hangs the run -- jest's own timing reads it.
 
 ### Adding a Worker Feature
 

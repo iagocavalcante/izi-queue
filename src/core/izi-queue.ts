@@ -229,7 +229,9 @@ export class IziQueue {
       node: this.config.node,
       queues: Array.from(this.queues.keys()),
       nodeTtl: this.nodeTtl,
-      isLeader: () => this.peer.isLeader()
+      isLeader: () => this.peer.isLeader(),
+      insert: (worker, options) => this.insertWithResult(worker, options),
+      logger: this.config.logger
     };
 
     for (const plugin of this.config.plugins) {

@@ -58,6 +58,20 @@ export interface UniqueOptions {
   keys?: string[];
   period?: number | 'infinity';
   states?: JobState[];
+  /**
+   * An opaque discriminator folded into the uniqueness digest, so two jobs
+   * that are otherwise identical are only "the same" within the same scope.
+   *
+   * This is what lets uniqueness be keyed on something that is not part of
+   * the job -- the scheduled minute, a tenant, a billing period. The cron
+   * plugin uses it to key each run on its minute, which is exact where a
+   * `period` window is not: two nodes evaluating the same minute a second
+   * apart collapse to one job, while consecutive minutes never collide no
+   * matter how close together the inserts land.
+   *
+   * Omitting it leaves the digest exactly as it was before this existed.
+   */
+  scope?: string;
 }
 
 export interface JobCriteria {

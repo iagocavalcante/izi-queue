@@ -28,6 +28,7 @@ A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](ht
   - [Unique Jobs](#unique-jobs)
   - [Worker Isolation](#worker-isolation)
   - [Plugins](#plugins)
+  - [Cron / Periodic Jobs](#cron--periodic-jobs)
   - [Leader Election](#leader-election)
   - [Telemetry](#telemetry)
 - [Managing Jobs](#managing-jobs)
@@ -208,6 +209,7 @@ await queue.insert('send_digest', {
     keys: ['userId'],           // Or compare only these keys within args
     period: 3600,               // Only one per hour (in seconds), or 'infinity'
     states: ['scheduled', 'available', 'executing'],
+    scope: 'tenant-42',         // Fold an extra discriminator into the digest
   },
 });
 ```
@@ -230,6 +232,11 @@ one job. Two notes on the semantics:
   enqueued.
 - **Argument order does not matter.** `{ a: 1, b: 2 }` and `{ b: 2, a: 1 }` are
   the same job on every adapter.
+- **`scope` keys uniqueness on something that is not part of the job** — a
+  tenant, a billing period, a scheduled minute. It is exact where a `period`
+  window is approximate: two inserts sharing a scope always collapse, and two
+  in different scopes never do, however close together they land. The
+  [cron plugin](#cron--periodic-jobs) uses it to key each run on its minute.
 
 ### Worker Isolation
 
@@ -301,9 +308,68 @@ backlog takes to scan. Staging (moving due `scheduled`/`retryable` jobs to
 `available`, which runs automatically -- no plugin needed) batches the same
 way; tune it with `stageBatchSize` on `IziQueue`'s config.
 
-Both plugins run on the elected leader only, so a five-node deployment prunes
-and rescues once per cycle rather than five times over the same rows. See
-[Leader Election](#leader-election).
+All three built-in plugins run on the elected leader only, so a five-node
+deployment prunes, rescues and evaluates the crontab once per cycle rather than
+five times over the same rows. See [Leader Election](#leader-election).
+
+### Cron / Periodic Jobs
+
+Run jobs on a schedule, the equivalent of `Oban.Plugins.Cron`:
+
+```typescript
+import { CronPlugin } from 'izi-queue';
+
+const queue = new IziQueue({
+  database: adapter,
+  queues: { default: 10, reports: 2 },
+  plugins: [
+    new CronPlugin({
+      timezone: 'America/Sao_Paulo',   // default for entries below; defaults to UTC
+      crontab: [
+        { expression: '0 * * * *', worker: 'HourlyWorker' },
+        { expression: '@daily', worker: 'DailyDigest', args: { scope: 'all' } },
+        { expression: '*/15 9-17 * * 1-5', worker: 'PollWorker', queue: 'reports' },
+        { expression: '0 3 * * *', worker: 'Backup', timezone: 'UTC' },
+      ],
+    }),
+  ],
+});
+```
+
+Standard five-field expressions (`minute hour day-of-month month day-of-week`)
+with ranges, lists, steps and names — `*/15`, `9-17`, `0,30`, `mon-fri`,
+`jan,jul`, `5/10` — plus the `@hourly`, `@daily`, `@midnight`, `@weekly`,
+`@monthly`, `@yearly` and `@annually` aliases. `7` is accepted as a second
+spelling of Sunday. Cron's day rule applies: when *both* day fields are
+restricted, a date matches if *either* does, so `0 0 13 * 5` means "the 13th,
+and every Friday".
+
+Each entry takes `args`, `queue`, `priority`, `maxAttempts`, `tags` and its own
+`timezone`; anything omitted falls back to the worker's own defaults. Inserted
+jobs carry `meta: { cron: true, cronExpression, cronMinute }`, so they are easy
+to pick out of `listJobs`.
+
+An invalid expression or timezone is rejected when the queue is constructed,
+naming the crontab entry at fault — a typo cannot become a job that silently
+never runs.
+
+**Exactly-once, per minute.** Evaluation is leader-only, and every insert is
+also unique on `(entry, minute)`. Both matter: leadership keeps the cluster
+from evaluating the crontab N times over, and the unique key is what makes the
+result correct rather than merely usually correct, since a leadership handover
+can legitimately have two nodes evaluate the same minute. The guard spans every
+job state, so a cron job that finishes in milliseconds is not reinserted by the
+next node to look at that minute.
+
+A tick delayed past its minute — a stalled event loop, a long GC pause — catches
+up on what it skipped rather than dropping those runs, bounded by
+`maxCatchUpMinutes` (default 5, maximum 60). A node that has just taken over
+leadership starts from the minute it was elected in instead of replaying
+everything the previous leader was handling perfectly well.
+
+Timezones are IANA names, resolved through `Intl`, so DST is handled the way
+cron conventionally handles it: a local hour that a spring-forward removes is
+skipped, and one that a fall-back repeats matches twice.
 
 ### Leader Election
 
