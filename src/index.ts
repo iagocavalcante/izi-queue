@@ -1,8 +1,15 @@
 // Main entry point
-export { IziQueue, createIziQueue, type IziQueueFullConfig, type InsertResult } from './core/izi-queue.js';
+export {
+  IziQueue,
+  createIziQueue,
+  type IziQueueFullConfig,
+  type InsertResult,
+  type QueueStatus
+} from './core/izi-queue.js';
 
 // Core exports
 export {
+  Peer,
   Queue,
   createJob,
   calculateBackoff,
@@ -51,7 +58,10 @@ export {
 export {
   DEFAULT_LIST_LIMIT,
   MAX_LIST_LIMIT,
-  JOB_STATES
+  JOB_STATES,
+  DEFAULT_LEADER_NAME,
+  DEFAULT_LEADERSHIP_INTERVAL,
+  DEFAULT_LEADERSHIP_TTL
 } from './database/adapter.js';
 
 // Plugins
@@ -79,6 +89,8 @@ export type {
   JobOrderBy,
   JobOrderByField,
   JobStateCounts,
+  LeaderInfo,
+  LeadershipConfig,
   UniqueOptions,
   WorkerResult,
   WorkerDefinition,

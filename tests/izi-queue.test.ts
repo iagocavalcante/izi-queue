@@ -957,7 +957,9 @@ describe('IziQueue Class', () => {
         name: 'default',
         state: 'running',
         limit: 5,
-        running: 0
+        running: 0,
+        // Single node, so it is always the leader.
+        isLeader: true
       });
 
       await queue.shutdown();

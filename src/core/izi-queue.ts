@@ -9,6 +9,7 @@ import type {
   JobInsertOptions,
   JobListCriteria,
   JobStateCounts,
+  LeaderInfo,
   TransactionHandle,
   QueueConfig,
   TelemetryEvent,
@@ -18,6 +19,7 @@ import type {
 import type { Plugin, PluginContext } from '../plugins/plugin.js';
 import { createJob } from './job.js';
 import { computeUniqueKey } from './unique.js';
+import { Peer } from './peer.js';
 import { Queue } from './queue.js';
 import { telemetry } from './telemetry.js';
 import { consoleLogger } from './logger.js';
@@ -63,6 +65,16 @@ export interface InsertResult<T = Record<string, unknown>> {
   conflict: boolean;
 }
 
+/** One queue's runtime state, as reported by `getQueueStatus`. */
+export interface QueueStatus {
+  name: string;
+  state: string;
+  limit: number;
+  running: number;
+  /** Whether this node holds the leadership lease -- node-wide, not per queue. */
+  isLeader: boolean;
+}
+
 export class IziQueue {
   private config: Required<Omit<IziQueueFullConfig, 'queues' | 'plugins' | 'isolation'>> & {
     queues: QueueConfig[];
@@ -70,6 +82,7 @@ export class IziQueue {
     isolation?: IsolationConfig;
   };
   private queues: Map<string, Queue> = new Map();
+  private readonly peer: Peer;
   private stageTimer?: ReturnType<typeof setInterval>;
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private started = false;
@@ -95,8 +108,19 @@ export class IziQueue {
       heartbeatInterval: config.heartbeatInterval ?? 15000,
       pollInterval: config.pollInterval ?? 1000,
       isolation: config.isolation,
+      leadership: config.leadership ?? true,
       logger: config.logger ?? consoleLogger
     };
+
+    // Constructed here rather than in `start()` so a misconfigured lease
+    // (a TTL shorter than the renewal interval, say) is rejected while the
+    // caller is still wiring things up, alongside plugin validation below.
+    this.peer = new Peer(
+      this.config.database,
+      this.config.node,
+      this.config.leadership,
+      this.config.logger
+    );
 
     if (this.config.isolation) {
       initializeIsolatedWorkers(this.config.isolation);
@@ -122,6 +146,27 @@ export class IziQueue {
 
   get isStarted(): boolean {
     return this.started;
+  }
+
+  /**
+   * Whether this node currently holds the leadership lease and is therefore
+   * the one staging jobs and running the built-in plugins (#26).
+   *
+   * Always true when `leadership` is disabled, or when the configured adapter
+   * predates `acquireLeadership` -- in both cases every node behaves as
+   * leader, which is the pre-#26 behavior.
+   */
+  isLeader(): boolean {
+    return this.peer.isLeader();
+  }
+
+  /**
+   * Reads the current lease holder from the database, which may be another
+   * node. Returns null when leadership is disabled, unsupported by the
+   * adapter, or genuinely vacant (every node's lease has lapsed).
+   */
+  async getLeader(): Promise<LeaderInfo | null> {
+    return this.peer.getLeader();
   }
 
   async migrate(): Promise<void> {
@@ -153,13 +198,19 @@ export class IziQueue {
       this.config.heartbeatInterval
     );
 
+    // Before the stage timer and the plugins, both of which are leader-gated:
+    // starting the peer first means a single-node deployment is already
+    // leading by the time its first tick fires, rather than idling through
+    // one interval.
+    await this.peer.start();
+
     for (const queueConfig of this.config.queues) {
       const queue = new Queue(queueConfig, this.config.database, this.config.node, this.config.logger);
       this.queues.set(queueConfig.name, queue);
     }
 
     this.stageTimer = setInterval(
-      () => this.stageJobs(),
+      () => this.stageJobsIfLeader(),
       this.config.stageInterval
     );
 
@@ -177,7 +228,8 @@ export class IziQueue {
       database: this.config.database,
       node: this.config.node,
       queues: Array.from(this.queues.keys()),
-      nodeTtl: this.nodeTtl
+      nodeTtl: this.nodeTtl,
+      isLeader: () => this.peer.isLeader()
     };
 
     for (const plugin of this.config.plugins) {
@@ -203,6 +255,11 @@ export class IziQueue {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
     }
+
+    // Released before the drain, not after: this node has already stopped
+    // staging and running plugins, so holding the lease for the length of the
+    // grace period would only stall whichever node takes over.
+    await this.peer.stop();
 
     await Promise.all(
       Array.from(this.queues.values()).map(q =>
@@ -634,39 +691,46 @@ export class IziQueue {
     this.queues.get(name)?.scale(limit);
   }
 
-  getQueueStatus(name: string): {
-    name: string;
-    state: string;
-    limit: number;
-    running: number;
-  } | null {
+  getQueueStatus(name: string): QueueStatus | null {
     const queue = this.queues.get(name);
     if (!queue) return null;
 
+    return this.statusOf(queue);
+  }
+
+  getAllQueueStatus(): QueueStatus[] {
+    return Array.from(this.queues.values()).map(queue => this.statusOf(queue));
+  }
+
+  /**
+   * `isLeader` rides along on every queue's status because that is what a
+   * `/health` endpoint already dumps -- without it, telling "this node is
+   * idle because there is no work" apart from "this node is idle because
+   * another node is leading" means a second call.
+   */
+  private statusOf(queue: Queue): QueueStatus {
     return {
       name: queue.name,
       state: queue.currentState,
       limit: queue.limit,
-      running: queue.runningCount
+      running: queue.runningCount,
+      isLeader: this.peer.isLeader()
     };
-  }
-
-  getAllQueueStatus(): Array<{
-    name: string;
-    state: string;
-    limit: number;
-    running: number;
-  }> {
-    return Array.from(this.queues.values()).map(queue => ({
-      name: queue.name,
-      state: queue.currentState,
-      limit: queue.limit,
-      running: queue.runningCount
-    }));
   }
 
   on(event: TelemetryEvent | '*', handler: TelemetryHandler): () => void {
     return telemetry.on(event, handler);
+  }
+
+  /**
+   * The stage timer's tick. Leader-only: N nodes issuing the same
+   * `UPDATE ... WHERE state IN ('scheduled', 'retryable')` every second is
+   * pure lock contention on the hottest table in the system (#26). Followers
+   * still poll their queues, so they pick the staged jobs up as usual.
+   */
+  private async stageJobsIfLeader(): Promise<void> {
+    if (!this.peer.isLeader()) return;
+    await this.stageJobs();
   }
 
   private async stageJobs(): Promise<void> {

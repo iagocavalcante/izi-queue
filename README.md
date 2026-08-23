@@ -28,6 +28,7 @@ A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](ht
   - [Unique Jobs](#unique-jobs)
   - [Worker Isolation](#worker-isolation)
   - [Plugins](#plugins)
+  - [Leader Election](#leader-election)
   - [Telemetry](#telemetry)
 - [Managing Jobs](#managing-jobs)
 - [Transactional Inserts](#transactional-inserts)
@@ -300,9 +301,76 @@ backlog takes to scan. Staging (moving due `scheduled`/`retryable` jobs to
 `available`, which runs automatically -- no plugin needed) batches the same
 way; tune it with `stageBatchSize` on `IziQueue`'s config.
 
-> Every node runs every plugin: there is no leader election yet
-> ([#26](https://github.com/iagocavalcante/izi-queue/issues/26)). With several
-> nodes this duplicates maintenance work against the same rows.
+Both plugins run on the elected leader only, so a five-node deployment prunes
+and rescues once per cycle rather than five times over the same rows. See
+[Leader Election](#leader-election).
+
+### Leader Election
+
+One node in a cluster is elected leader, and only the leader stages jobs and
+runs the built-in plugins. Without it, N nodes issue N copies of the same
+`UPDATE`/`DELETE` against the hottest table in the system on every tick — pure
+lock contention that grows with the cluster.
+
+It is on by default and needs no configuration. On a single node the only
+candidate always wins, so nothing changes.
+
+```typescript
+const queue = new IziQueue({
+  database: adapter,
+  queues: { default: 10 },
+  node: 'worker-1',
+  leadership: {
+    name: 'default',   // leadership scope; one leader is elected per name
+    interval: 10000,   // how often the lease is renewed, in ms
+    ttl: 30,           // how long a lease is good for, in seconds
+  },
+});
+
+queue.isLeader();            // true if this node is currently leading
+await queue.getLeader();     // { node, electedAt, expiresAt } | null
+queue.getQueueStatus('default')?.isLeader;
+```
+
+The lease lives in `izi_peers`, one row per scope, and every node runs the same
+renew-or-take-over statement on `interval`. The database decides who wins — the
+race is between nodes, so it cannot be settled in JavaScript. A leader that
+stops renewing (crash, partition, a process wedged past the TTL) is replaced
+`ttl` seconds after its last successful renewal; a clean shutdown hands the
+lease back immediately instead of waiting that out.
+
+What followers keep doing: polling, fetching, and executing jobs, exactly as
+before. Only cluster-wide maintenance is gated. `drain()` also stages
+regardless of leadership, since it is an explicit request from the caller.
+
+Two knobs worth understanding:
+
+- `ttl` is the worst-case pause in staging after a leader dies, so a longer
+  lease trades faster failover for fewer renewals. It must be at least twice
+  `interval`, or a single slow renewal would hand leadership away from a
+  healthy node; izi-queue rejects a configuration where it is not.
+- `name` scopes the election. Two deployments sharing one database each need
+  their own name, or they will elect a single leader between them.
+
+Leadership is advisory, not a fence: a leader stalled past its TTL can still
+believe it leads while a successor is elected. Everything gated on it is
+idempotent, so a brief overlap costs at most the duplicated work that used to
+happen unconditionally.
+
+Set `leadership: false` to restore the old behavior where every node stages
+and runs every plugin. A custom adapter that does not implement
+`acquireLeadership` behaves that way too, since it cannot elect anyone.
+
+Writing a plugin? Gate any tick that writes rows other nodes can see:
+
+```typescript
+class MyPlugin extends BasePlugin {
+  private async tick() {
+    if (!this.isLeader()) return;
+    // ... cluster-wide maintenance
+  }
+}
+```
 
 ### Telemetry
 
@@ -331,10 +399,14 @@ queue.on('*', ({ event, job }) => {
 - `queue:start`, `queue:stop`, `queue:pause`, `queue:resume`
 - `thread:spawn`, `thread:exit`
 - `plugin:start`, `plugin:stop`, `plugin:error`
+- `peer:elected`, `peer:lost`, `peer:error`
 
 `job:transition_refused` fires when a result could not be written because the
 job had already moved on — cancelled by an operator, or rescued onto another
-node. `jobs:pruned` and `job:rescue` carry `result`, not `job`.
+node. `jobs:pruned` and `job:rescue` carry `result`, not `job`. The `peer:*`
+events carry `node`: `peer:elected` and `peer:lost` fire only on a change of
+leadership, not on every renewal, and `peer:error` means an election round
+could not reach the database — the node stands down until one succeeds.
 
 ## Managing Jobs
 
@@ -447,11 +519,13 @@ const queue = new IziQueue({
 });
 ```
 
+Staging and the built-in plugins run on one elected node rather than on all of
+them — see [Leader Election](#leader-election).
+
 Two caveats when scaling out:
 
 - Concurrency limits are **per node**. Five nodes with `{ default: 10 }` run up
   to 50 jobs at once ([#37](https://github.com/iagocavalcante/izi-queue/issues/37)).
-- Every node runs every plugin ([#26](https://github.com/iagocavalcante/izi-queue/issues/26)).
 - A worker that blocks the event loop for longer than the node TTL stops the
   heartbeat and may be treated as dead. Use isolated workers for CPU-bound work.
 

@@ -27,6 +27,7 @@ src/
 │   ├── izi-queue.ts      # Main IziQueue class (orchestrator)
 │   ├── queue.ts          # Queue class (worker execution)
 │   ├── job.ts            # Job state machine & backoff
+│   ├── peer.ts           # Leader election (izi_peers lease)
 │   ├── unique.ts         # Uniqueness digest & advisory lock keys
 │   ├── worker.ts         # Worker registry & execution
 │   ├── telemetry.ts      # Event system
@@ -39,6 +40,7 @@ src/
 │   ├── index.ts
 │   ├── adapter.ts        # BaseAdapter interface
 │   ├── postgres.ts       # PostgreSQL implementation
+│   ├── mysql.ts          # MySQL implementation
 │   ├── sqlite.ts         # SQLite implementation
 │   └── migrations.ts     # Migration definitions
 └── plugins/
@@ -202,6 +204,12 @@ export abstract class BasePlugin implements Plugin {
 
 **To create a plugin:** Extend `BasePlugin`, implement `onStart()`.
 
+**Gate cluster-wide work on `this.isLeader()`.** A plugin tick that writes rows
+other nodes can also see runs N times over on an N-node cluster otherwise. Only
+node-local work belongs outside the gate. `PluginContext.isLeader` is absent on
+a hand-built context, which `BasePlugin.isLeader()` reads as "leading", so a
+plugin can never quietly stop doing its work because a harness forgot it.
+
 ### 7. Observable Pattern (Telemetry)
 
 Event-based system for monitoring and debugging.
@@ -320,6 +328,15 @@ CREATE TABLE izi_nodes (
   heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Leadership lease, one row per scope. Only the holder stages jobs and runs
+-- the maintenance plugins.
+CREATE TABLE izi_peers (
+  name VARCHAR(255) PRIMARY KEY,
+  node VARCHAR(255) NOT NULL,
+  elected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+
 -- Critical indexes
 CREATE INDEX izi_jobs_queue_state_idx ON izi_jobs (queue, state);
 CREATE INDEX izi_jobs_stageable_idx ON izi_jobs (scheduled_at)
@@ -330,6 +347,26 @@ CREATE INDEX izi_jobs_unique_key_idx ON izi_jobs (unique_key) WHERE unique_key I
 **Never index `args` directly.** A btree entry is capped at ~2704 bytes and a
 JSONB value that does not compress below it fails the insert outright. That is
 why uniqueness is keyed on a digest.
+
+### Leader Election
+
+`izi_peers` holds one lease row per scope. Acquisition is a renew-or-take-over
+`UPDATE` whose `WHERE` matches only for the incumbent or, once the lease lapses,
+whoever wins the race — followed by a conflict-tolerant `INSERT` when no row
+exists yet, and then a read-back to settle the outcome.
+
+**The read-back is not optional.** MySQL reports *matched* rather than *changed*
+rows once the driver negotiates `CLIENT_FOUND_ROWS`, which mysql2 does by
+default, so a losing `INSERT ... ON DUPLICATE KEY UPDATE` is indistinguishable
+from a winning insert by row count alone. Twenty nodes racing all came away
+believing they led. `BaseAdapter.electLeader` encodes the whole sequence once so
+the three adapters cannot drift on the one operation whose entire purpose is
+that every node agrees.
+
+MySQL also evaluates a multi-column `SET` left to right, letting later
+expressions see values assigned by earlier ones — so `renewLeadership` computes
+`elected_at` *before* overwriting `node`, or every renewal would look like a
+handover.
 
 ### Concurrency Control
 

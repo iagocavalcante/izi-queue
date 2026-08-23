@@ -45,6 +45,10 @@ export class PrunerPlugin extends BasePlugin {
   private async prune(): Promise<void> {
     if (!this.context || !this.running) return;
 
+    // N nodes each running a large DELETE over the same range is the exact
+    // contention leader election exists to remove.
+    if (!this.isLeader()) return;
+
     try {
       const database = this.context.database;
       const pruned = await runInBatches(

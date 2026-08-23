@@ -49,12 +49,12 @@ describePostgres('PostgresAdapter', () => {
   });
 
   afterAll(async () => {
-    await pool.query('DROP TABLE IF EXISTS izi_jobs, izi_nodes, izi_migrations');
+    await pool.query('DROP TABLE IF EXISTS izi_jobs, izi_nodes, izi_peers, izi_migrations');
     await pool.end();
   });
 
   beforeEach(async () => {
-    await pool.query('TRUNCATE izi_jobs, izi_nodes');
+    await pool.query('TRUNCATE izi_jobs, izi_nodes, izi_peers');
   });
 
   it('applies every migration', async () => {
@@ -808,5 +808,96 @@ describePostgres('PostgresAdapter', () => {
         await reconnectPool.end();
       }
     }, 20000);
+  });
+
+  describe('leadership', () => {
+    it('acquires a vacant lease', async () => {
+      expect(await adapter.acquireLeadership('default', 'node-a', 30)).toBe(true);
+      expect((await adapter.getLeader('default'))?.node).toBe('node-a');
+    });
+
+    it('renews its own lease without resetting when it was elected', async () => {
+      await adapter.acquireLeadership('default', 'node-a', 30);
+      const first = await adapter.getLeader('default');
+
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(await adapter.acquireLeadership('default', 'node-a', 30)).toBe(true);
+      const renewed = await adapter.getLeader('default');
+
+      expect(renewed?.electedAt.getTime()).toBe(first?.electedAt.getTime());
+      expect(renewed!.expiresAt.getTime()).toBeGreaterThan(first!.expiresAt.getTime());
+    });
+
+    it('refuses a lease another node still holds', async () => {
+      await adapter.acquireLeadership('default', 'node-a', 30);
+      expect(await adapter.acquireLeadership('default', 'node-b', 30)).toBe(false);
+      expect((await adapter.getLeader('default'))?.node).toBe('node-a');
+    });
+
+    it('takes over an expired lease and records the handover', async () => {
+      await adapter.acquireLeadership('default', 'node-a', 30);
+      const before = await adapter.getLeader('default');
+      await pool.query("UPDATE izi_peers SET expires_at = NOW() - INTERVAL '1 minute'");
+
+      expect(await adapter.acquireLeadership('default', 'node-b', 30)).toBe(true);
+      const after = await adapter.getLeader('default');
+
+      expect(after?.node).toBe('node-b');
+      expect(after!.electedAt.getTime()).toBeGreaterThan(before!.electedAt.getTime() - 1);
+    });
+
+    it('reports no leader once the lease lapses', async () => {
+      await adapter.acquireLeadership('default', 'node-a', 30);
+      await pool.query("UPDATE izi_peers SET expires_at = NOW() - INTERVAL '1 minute'");
+
+      expect(await adapter.getLeader('default')).toBeNull();
+    });
+
+    it('releases the lease it holds', async () => {
+      await adapter.acquireLeadership('default', 'node-a', 300);
+      await adapter.releaseLeadership('default', 'node-a');
+
+      expect(await adapter.getLeader('default')).toBeNull();
+      expect(await adapter.acquireLeadership('default', 'node-b', 30)).toBe(true);
+    });
+
+    it('will not release a lease held by another node', async () => {
+      await adapter.acquireLeadership('default', 'node-a', 300);
+      await adapter.releaseLeadership('default', 'node-b');
+
+      expect((await adapter.getLeader('default'))?.node).toBe('node-a');
+    });
+
+    it('keeps separate scopes independent', async () => {
+      expect(await adapter.acquireLeadership('app', 'node-a', 30)).toBe(true);
+      expect(await adapter.acquireLeadership('worker', 'node-b', 30)).toBe(true);
+
+      expect((await adapter.getLeader('app'))?.node).toBe('node-a');
+      expect((await adapter.getLeader('worker'))?.node).toBe('node-b');
+    });
+
+    // The point of the whole exercise: without the database arbitrating, a
+    // cluster booting at once produces several nodes all convinced they lead.
+    it('elects exactly one node when twenty race for a vacant lease', async () => {
+      const results = await Promise.all(
+        Array.from({ length: 20 }, (_, i) => adapter.acquireLeadership('default', `node-${i}`, 30))
+      );
+
+      expect(results.filter(Boolean)).toHaveLength(1);
+      const leader = await adapter.getLeader('default');
+      expect(leader).not.toBeNull();
+    });
+
+    it('elects exactly one node when twenty race for an expired lease', async () => {
+      await adapter.acquireLeadership('default', 'incumbent', 30);
+      await pool.query("UPDATE izi_peers SET expires_at = NOW() - INTERVAL '1 minute'");
+
+      const results = await Promise.all(
+        Array.from({ length: 20 }, (_, i) => adapter.acquireLeadership('default', `node-${i}`, 30))
+      );
+
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect((await adapter.getLeader('default'))?.node).not.toBe('incumbent');
+    });
   });
 });

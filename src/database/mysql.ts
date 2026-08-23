@@ -30,6 +30,7 @@ import type {
   JobListCriteria,
   JobState,
   JobStateCounts,
+  LeaderInfo,
   Logger,
   TransactionHandle,
   UniqueOptions
@@ -371,6 +372,48 @@ export class MySQLAdapter extends BaseAdapter {
 
   async removeNode(node: string): Promise<void> {
     await this.pool.query(SQL.mysql.removeNode, [node]);
+  }
+
+  /**
+   * See `BaseAdapter.electLeader`. The renewal's row count is trustworthy on
+   * either of MySQL's accountings -- it matches only when this node may hold
+   * the lease, and it always moves `expires_at` forward when it does -- but
+   * the claim's is not, which is why the outcome is read back instead.
+   */
+  async acquireLeadership(name: string, node: string, ttlSeconds: number): Promise<boolean> {
+    return this.electLeader(
+      node,
+      async () => {
+        const [renewed] = await this.pool.query<ResultSetHeader>(SQL.mysql.renewLeadership, [
+          node,
+          node,
+          ttlSeconds,
+          name,
+          node
+        ]);
+        return renewed.affectedRows;
+      },
+      async () => {
+        await this.pool.query(SQL.mysql.claimLeadership, [name, node, ttlSeconds]);
+      },
+      () => this.getLeader(name)
+    );
+  }
+
+  async releaseLeadership(name: string, node: string): Promise<void> {
+    await this.pool.query(SQL.mysql.releaseLeadership, [name, node]);
+  }
+
+  async getLeader(name: string): Promise<LeaderInfo | null> {
+    const [rows] = await this.pool.query<RowDataPacket[]>(SQL.mysql.getLeader, [name]);
+    const row = rows[0];
+    if (!row) return null;
+
+    return {
+      node: row.node as string,
+      electedAt: new Date(row.elected_at as string),
+      expiresAt: new Date(row.expires_at as string)
+    };
   }
 
   private uniqueLookupSql(withPeriod: boolean): string {

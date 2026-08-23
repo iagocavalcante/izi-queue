@@ -126,6 +126,21 @@ export const postgresMigrations: Migration[] = [
       `DROP INDEX IF EXISTS izi_jobs_unique_key_idx`,
       `ALTER TABLE izi_jobs DROP COLUMN IF EXISTS unique_key`
     ]
+  },
+  {
+    version: 8,
+    name: 'create_izi_peers_table',
+    up: [
+      `CREATE TABLE IF NOT EXISTS izi_peers (
+        name VARCHAR(255) PRIMARY KEY,
+        node VARCHAR(255) NOT NULL,
+        elected_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL
+      )`
+    ],
+    down: [
+      `DROP TABLE IF EXISTS izi_peers`
+    ]
   }
 ];
 
@@ -224,6 +239,21 @@ export const sqliteMigrations: Migration[] = [
     down: [
       `DROP INDEX IF EXISTS izi_jobs_unique_key_idx`
     ]
+  },
+  {
+    version: 7,
+    name: 'create_izi_peers_table',
+    up: [
+      `CREATE TABLE IF NOT EXISTS izi_peers (
+        name TEXT PRIMARY KEY,
+        node TEXT NOT NULL,
+        elected_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL
+      )`
+    ],
+    down: [
+      `DROP TABLE IF EXISTS izi_peers`
+    ]
   }
 ];
 
@@ -319,6 +349,21 @@ export const mysqlMigrations: Migration[] = [
     ],
     down: [
       `DROP INDEX izi_jobs_unique_key_idx ON izi_jobs`
+    ]
+  },
+  {
+    version: 7,
+    name: 'create_izi_peers_table',
+    up: [
+      `CREATE TABLE IF NOT EXISTS izi_peers (
+        name VARCHAR(255) PRIMARY KEY,
+        node VARCHAR(255) NOT NULL,
+        elected_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+        expires_at TIMESTAMP(6) NOT NULL
+      )`
+    ],
+    down: [
+      `DROP TABLE IF EXISTS izi_peers`
     ]
   }
 ];

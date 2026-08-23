@@ -113,6 +113,45 @@ export interface JobListCriteria extends JobCriteria {
 export type JobStateCounts = Record<JobState, number>;
 
 /**
+ * Who currently holds a leadership lease, as reported by
+ * `DatabaseAdapter.getLeader`/`IziQueue.getLeader`.
+ */
+export interface LeaderInfo {
+  /** The node name holding the lease. */
+  node: string;
+  /** When that node most recently *took over* -- not when it last renewed. */
+  electedAt: Date;
+  /** When the lease lapses unless renewed before then. */
+  expiresAt: Date;
+}
+
+/**
+ * Tuning for leader election. One leader is elected per `name`, and only the
+ * leader stages jobs and runs the built-in plugins -- see
+ * `IziQueueConfig.leadership`.
+ */
+export interface LeadershipConfig {
+  /**
+   * The leadership scope. Two deployments sharing one database but wanting
+   * their own leader (say, a staging and a production app pointed at the same
+   * server) must set different names. Defaults to `'default'`.
+   */
+  name?: string;
+  /**
+   * How often the lease is renewed / an election is attempted, in ms.
+   * Defaults to 10000.
+   */
+  interval?: number;
+  /**
+   * How long a lease is good for, in seconds. A leader that stops renewing is
+   * replaced this long after its last successful renewal, which is also the
+   * worst-case pause in staging and plugin work after a leader dies. Must be
+   * comfortably longer than `interval`. Defaults to 30.
+   */
+  ttl?: number;
+}
+
+/**
  * A caller-managed transaction handle, passed straight through to the adapter.
  * Adapter-specific by nature, so the shared type stays open and each adapter
  * validates what it is given:
@@ -376,6 +415,29 @@ export interface DatabaseAdapter {
   /** Removes a node's liveness record on graceful shutdown. */
   removeNode?(node: string): Promise<void>;
   /**
+   * Acquires the leadership lease for `name`, or renews it if this node
+   * already holds it, and reports whether `node` holds it afterwards. Must be
+   * atomic: every node calls this on the same interval, and at most one of
+   * them may come away with `true`.
+   *
+   * A lease that has not been renewed within `ttlSeconds` is up for grabs by
+   * any node.
+   *
+   * Optional so third-party adapters predating leader election keep
+   * compiling. An adapter that does not implement it makes every node behave
+   * as leader -- the pre-#26 behavior -- rather than leaving the cluster with
+   * no leader at all.
+   */
+  acquireLeadership?(name: string, node: string, ttlSeconds: number): Promise<boolean>;
+  /**
+   * Gives up the lease for `name` if `node` holds it, so a successor can take
+   * over immediately instead of waiting out the TTL. A no-op when this node is
+   * not the leader.
+   */
+  releaseLeadership?(name: string, node: string): Promise<void>;
+  /** Returns the unexpired lease holder for `name`, or null if there is none. */
+  getLeader?(name: string): Promise<LeaderInfo | null>;
+  /**
    * @deprecated Superseded by `insertUnique`, which is atomic. Retained so
    * third-party adapters keep working; the check-then-insert it supports races
    * between concurrent callers.
@@ -449,6 +511,21 @@ export interface IziQueueConfig {
   pollInterval?: number;
   isolation?: IsolationConfig;
   /**
+   * Leader election. Only the leader stages jobs and runs the built-in
+   * plugins, so a horizontally scaled deployment does that work once rather
+   * than once per node (#26).
+   *
+   * Enabled by default. On a single node this changes nothing -- the only
+   * candidate always wins -- and it is what stops N nodes from issuing N
+   * concurrent `UPDATE`s over the same scheduled rows every tick.
+   *
+   * Set to `false` to restore the pre-#26 behavior where every node stages
+   * and runs every plugin. An adapter that does not implement
+   * `acquireLeadership` behaves that way regardless, since it cannot elect
+   * anyone.
+   */
+  leadership?: boolean | LeadershipConfig;
+  /**
    * Where izi-queue reports its own operational logging (staging/fetch
    * errors, node heartbeat failures, ...). Defaults to `consoleLogger`, which
    * preserves the pre-#40 behavior of writing to `console.*`.
@@ -488,7 +565,10 @@ export type TelemetryEvent =
   | 'thread:exit'
   | 'plugin:start'
   | 'plugin:stop'
-  | 'plugin:error';
+  | 'plugin:error'
+  | 'peer:elected'
+  | 'peer:lost'
+  | 'peer:error';
 
 export interface TelemetryPayload {
   event: TelemetryEvent;
@@ -500,6 +580,8 @@ export interface TelemetryPayload {
   timestamp: Date;
   threadId?: number;
   isolated?: boolean;
+  /** The node a `peer:*` event concerns. */
+  node?: string;
 }
 
 export type TelemetryHandler = (payload: TelemetryPayload) => void;
