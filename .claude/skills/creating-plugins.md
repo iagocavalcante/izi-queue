@@ -39,13 +39,19 @@ export class MyPlugin extends BasePlugin {
   private async tick(): Promise<void> {
     if (!this.context || !this.running) return;
 
+    // Cluster-wide work belongs behind the leader gate: without it, an N-node
+    // deployment does this N times over against the same rows.
+    if (!this.isLeader()) return;
+
     try {
       // Your periodic logic here
       // Access database via this.context.database
+      // Enqueue jobs via this.context.insert (never database.insertJob --
+      // that skips worker defaults, uniqueness and the queue wake-up)
       // Access node ID via this.context.node
       // Access queue names via this.context.queues
     } catch (error) {
-      console.error(`[${this.name}] Error:`, error);
+      this.log.error(`${this.name} tick failed`, { error });
     }
   }
 }
@@ -60,8 +66,22 @@ interface PluginContext {
   database: DatabaseAdapter;  // Database operations
   node: string;               // Current node identifier
   queues: string[];           // List of queue names
+  nodeTtl?: number;           // Seconds before a silent node is presumed dead
+  isLeader?: () => boolean;   // Whether this node holds the leadership lease
+  insert?: (worker, options) => Promise<{ job: Job; conflict: boolean }>;
+  logger?: Logger;            // The owning queue's logger
 }
 ```
+
+The optional members are optional only so a hand-built context still
+type-checks; `IziQueue` always supplies all of them. Read them through
+`BasePlugin`'s helpers rather than directly: `this.isLeader()` treats an absent
+one as leading (so a plugin never quietly stops working because a harness
+forgot it), and `this.log` falls back to a no-op logger.
+
+A plugin that genuinely cannot work without one — the cron plugin needs
+`insert` — should say so by throwing from `onStart` with a message naming what
+is missing.
 
 ## Built-in Plugin Examples
 

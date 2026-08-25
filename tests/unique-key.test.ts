@@ -121,6 +121,37 @@ describe('computeUniqueKey', () => {
     expect(key).not.toBe(computeUniqueKey(job({ args: { x: 'v' } }), { keys: ['x'] }));
   });
 
+  it('separates jobs by scope', () => {
+    const january = computeUniqueKey(job({ args: { userId: 1 } }), { scope: '2026-01' });
+    const february = computeUniqueKey(job({ args: { userId: 1 } }), { scope: '2026-02' });
+
+    expect(january).not.toBe(february);
+  });
+
+  it('collapses identical jobs sharing a scope', () => {
+    const a = computeUniqueKey(job({ args: { userId: 1 } }), { scope: 'cron:2026-08-24T09:00Z' });
+    const b = computeUniqueKey(job({ args: { userId: 1 } }), { scope: 'cron:2026-08-24T09:00Z' });
+
+    expect(a).toBe(b);
+  });
+
+  it('still distinguishes different jobs within one scope', () => {
+    const first = computeUniqueKey(job({ args: { userId: 1 } }), { scope: 'batch-7' });
+    const second = computeUniqueKey(job({ args: { userId: 2 } }), { scope: 'batch-7' });
+
+    expect(first).not.toBe(second);
+  });
+
+  it('leaves the digest untouched when no scope is given', () => {
+    // Adding scopes must not invalidate unique keys already stored in
+    // izi_jobs, or every in-flight unique job would stop deduplicating.
+    expect(computeUniqueKey(job({ args: { userId: 1 } }), DEFAULTS)).toBe(
+      // sha256 of [["worker","SendEmail"],["queue","default"],["args",[["userId",1]]]],
+      // computed independently of this implementation.
+      'c1375b5e4b05b9dc3f551d295fe37e51'
+    );
+  });
+
   it('produces a key short enough for a MySQL lock name', () => {
     // GET_LOCK names are capped at 64 characters.
     expect(computeUniqueKey(job(), DEFAULTS).length).toBeLessThanOrEqual(64);
