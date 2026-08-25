@@ -30,6 +30,22 @@ export const DEFAULT_NODE_TTL = 60;
 export const DEFAULT_BATCH_SIZE = 5000;
 
 /**
+ * Leadership scope used when none is configured. One leader is elected per
+ * scope, so two logically separate deployments sharing a database stay
+ * independent by giving each its own name.
+ */
+export const DEFAULT_LEADER_NAME = 'default';
+
+/**
+ * How often the leader renews its lease, in ms, and how long the lease is
+ * good for, in seconds. Three missed renewals before another node may take
+ * over -- the same "four missed beats" shape as `DEFAULT_NODE_TTL`, but
+ * shorter, because nothing stages jobs while the lease sits expired.
+ */
+export const DEFAULT_LEADERSHIP_INTERVAL = 10000;
+export const DEFAULT_LEADERSHIP_TTL = 30;
+
+/**
  * Repeatedly calls `operation(limit)` -- which should perform at most `limit`
  * rows of work and return how many it actually touched -- until a call
  * touches fewer than `limit` rows, i.e. the backlog is exhausted. Yields to
@@ -236,7 +252,28 @@ export const SQL = {
       WHERE worker = $1
         AND state = ANY($2)
         AND inserted_at > NOW() - INTERVAL '1 second' * $3
-    `
+    `,
+    // Renews our own lease, or takes over an expired one, in a single
+    // statement -- the `WHERE` is what makes it safe to run concurrently on
+    // every node: only the incumbent (or, once it lapses, whichever node
+    // wins the race) matches. A non-zero row count means we hold the lease.
+    renewLeadership: `
+      UPDATE izi_peers
+      SET node = $2,
+          elected_at = CASE WHEN node = $2 THEN elected_at ELSE NOW() END,
+          expires_at = NOW() + INTERVAL '1 second' * $3
+      WHERE name = $1 AND (node = $2 OR expires_at <= NOW())
+    `,
+    // Only reached when no row exists yet. `DO NOTHING` turns the race
+    // between two nodes booting at once into a row count rather than a
+    // primary-key violation one of them has to catch.
+    claimLeadership: `
+      INSERT INTO izi_peers (name, node, expires_at)
+      VALUES ($1, $2, NOW() + INTERVAL '1 second' * $3)
+      ON CONFLICT (name) DO NOTHING
+    `,
+    releaseLeadership: 'DELETE FROM izi_peers WHERE name = $1 AND node = $2',
+    getLeader: 'SELECT node, elected_at, expires_at FROM izi_peers WHERE name = $1 AND expires_at > NOW()'
   },
 
   mysql: {
@@ -349,7 +386,28 @@ export const SQL = {
       WHERE worker = ?
         AND state IN (?)
         AND inserted_at > DATE_SUB(NOW(), INTERVAL ? SECOND)
-    `
+    `,
+    // MySQL evaluates a multi-column SET left to right, and later expressions
+    // see the values assigned by earlier ones -- so `elected_at` has to be
+    // computed before `node` is overwritten, or it would always compare a
+    // node against itself.
+    renewLeadership: `
+      UPDATE izi_peers
+      SET elected_at = CASE WHEN node = ? THEN elected_at ELSE NOW(6) END,
+          node = ?,
+          expires_at = DATE_ADD(NOW(6), INTERVAL ? SECOND)
+      WHERE name = ? AND (node = ? OR expires_at <= NOW(6))
+    `,
+    // `ON DUPLICATE KEY UPDATE name = name` rather than `INSERT IGNORE`: it
+    // reports the same zero affected rows on conflict without also
+    // downgrading unrelated errors to warnings.
+    claimLeadership: `
+      INSERT INTO izi_peers (name, node, expires_at)
+      VALUES (?, ?, DATE_ADD(NOW(6), INTERVAL ? SECOND))
+      ON DUPLICATE KEY UPDATE name = name
+    `,
+    releaseLeadership: 'DELETE FROM izi_peers WHERE name = ? AND node = ?',
+    getLeader: 'SELECT node, elected_at, expires_at FROM izi_peers WHERE name = ? AND expires_at > NOW(6)'
   },
 
   sqlite: {
@@ -462,6 +520,24 @@ export const SQL = {
       WHERE worker = ?
         AND state IN (SELECT value FROM json_each(?))
         AND datetime(inserted_at) > datetime('now', '-' || ? || ' seconds')
+    `,
+    // SQLite evaluates every SET expression against the pre-update row, so
+    // unlike MySQL the assignment order here carries no meaning.
+    renewLeadership: `
+      UPDATE izi_peers
+      SET node = ?,
+          elected_at = CASE WHEN node = ? THEN elected_at ELSE datetime('now') END,
+          expires_at = datetime('now', '+' || ? || ' seconds')
+      WHERE name = ? AND (node = ? OR datetime(expires_at) <= datetime('now'))
+    `,
+    claimLeadership: `
+      INSERT OR IGNORE INTO izi_peers (name, node, expires_at)
+      VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))
+    `,
+    releaseLeadership: 'DELETE FROM izi_peers WHERE name = ? AND node = ?',
+    getLeader: `
+      SELECT node, elected_at, expires_at FROM izi_peers
+      WHERE name = ? AND datetime(expires_at) > datetime('now')
     `
   }
 };
@@ -693,6 +769,39 @@ export abstract class BaseAdapter implements DatabaseAdapter {
   abstract stageJobs(limit?: number): Promise<number>;
   abstract cancelJobs(criteria: import('../types.js').JobCriteria): Promise<number>;
   abstract rescueStuckJobs(rescueAfter: number, nodeTtl?: number): Promise<number>;
+
+  /**
+   * The leader-election algorithm every adapter shares, so the three of them
+   * cannot drift apart on the one operation whose whole purpose is that all
+   * nodes agree.
+   *
+   * `renew` runs the atomic renew-or-take-over statement and reports how many
+   * rows it matched: a non-zero count is definitive, because its `WHERE` only
+   * matches when this node either already holds the lease or may take it.
+   *
+   * Zero means either that no row exists yet or that a live lease belongs to
+   * somebody else, so `claim` (a conflict-tolerant insert) runs and `read`
+   * settles it. Deliberately *not* decided on the claim's row count: MySQL
+   * reports matched rather than changed rows when the driver negotiates
+   * `CLIENT_FOUND_ROWS` -- which mysql2 does by default -- so a losing
+   * `ON DUPLICATE KEY UPDATE` looks identical to a winning insert. Reading
+   * the row back is unambiguous on every dialect and driver.
+   *
+   * The read is a separate statement from the write, so it can only be stale
+   * in the safe direction: seeing another node means standing down, and
+   * seeing our own name means we held the lease as of that read.
+   */
+  protected async electLeader(
+    node: string,
+    renew: () => Promise<number>,
+    claim: () => Promise<void>,
+    read: () => Promise<import('../types.js').LeaderInfo | null>
+  ): Promise<boolean> {
+    if ((await renew()) > 0) return true;
+
+    await claim();
+    return (await read())?.node === node;
+  }
 
   /** Shared predicate for locating an existing unique job. */
   protected uniqueLookup(options: import('../types.js').UniqueOptions): {

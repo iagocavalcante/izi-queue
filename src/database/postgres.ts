@@ -6,6 +6,7 @@ import type {
   JobListCriteria,
   JobState,
   JobStateCounts,
+  LeaderInfo,
   Logger,
   TransactionHandle,
   UniqueOptions
@@ -363,6 +364,37 @@ export class PostgresAdapter extends BaseAdapter {
 
   async removeNode(node: string): Promise<void> {
     await this.pool.query(SQL.postgres.removeNode, [node]);
+  }
+
+  /** See `BaseAdapter.electLeader` for why this is shaped the way it is. */
+  async acquireLeadership(name: string, node: string, ttlSeconds: number): Promise<boolean> {
+    return this.electLeader(
+      node,
+      async () => {
+        const renewed = await this.pool.query(SQL.postgres.renewLeadership, [name, node, ttlSeconds]);
+        return renewed.rowCount ?? 0;
+      },
+      async () => {
+        await this.pool.query(SQL.postgres.claimLeadership, [name, node, ttlSeconds]);
+      },
+      () => this.getLeader(name)
+    );
+  }
+
+  async releaseLeadership(name: string, node: string): Promise<void> {
+    await this.pool.query(SQL.postgres.releaseLeadership, [name, node]);
+  }
+
+  async getLeader(name: string): Promise<LeaderInfo | null> {
+    const result = await this.pool.query(SQL.postgres.getLeader, [name]);
+    const row = result.rows[0];
+    if (!row) return null;
+
+    return {
+      node: row.node as string,
+      electedAt: new Date(row.elected_at as string),
+      expiresAt: new Date(row.expires_at as string)
+    };
   }
 
   async checkUnique(options: UniqueOptions, job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job | null> {

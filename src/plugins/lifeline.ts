@@ -38,6 +38,10 @@ export class LifelinePlugin extends BasePlugin {
   private async rescue(): Promise<void> {
     if (!this.context || !this.running) return;
 
+    // Rescuing is cluster-wide: every node would otherwise issue the same
+    // UPDATE over the same abandoned rows on every tick.
+    if (!this.isLeader()) return;
+
     try {
       const rescued = await this.context.database.rescueStuckJobs(
         this.config.rescueAfter,

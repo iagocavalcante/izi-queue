@@ -10,6 +10,19 @@ export interface PluginContext {
   queues: string[];
   /** Seconds without a heartbeat after which a node is presumed dead. */
   nodeTtl?: number;
+  /**
+   * Whether the owning node currently holds the leadership lease. Maintenance
+   * work belongs behind this: with N nodes, an ungated plugin does its work N
+   * times over, against the same rows (#26).
+   *
+   * Always true when leadership is disabled or the adapter does not support
+   * it, so gating on it never leaves the work undone.
+   *
+   * Optional purely so a hand-built context (a test, a bespoke harness) still
+   * type-checks; `IziQueue` always supplies it, and `BasePlugin.isLeader()`
+   * treats an absent one as leader.
+   */
+  isLeader?: () => boolean;
 }
 
 export interface Plugin {
@@ -45,6 +58,15 @@ export abstract class BasePlugin implements Plugin {
   protected abstract onStart(): Promise<void>;
 
   protected async onStop(): Promise<void> {}
+
+  /**
+   * Whether this node may do cluster-wide maintenance work right now. Gate
+   * every periodic tick that writes rows other nodes also see on it; leave
+   * node-local work ungated.
+   */
+  protected isLeader(): boolean {
+    return this.context?.isLeader?.() ?? true;
+  }
 
   validate(): string[] {
     return [];

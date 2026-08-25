@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is below 1.0.0, breaking changes are released as minor versions.
 
+## [Unreleased]
+
+### Added
+
+- **Leader election.** One node per cluster is elected leader, and only the
+  leader stages jobs and runs the built-in plugins. Previously every node ran
+  every plugin and its own stager, so N nodes issued N copies of the same
+  `UPDATE`/`DELETE` against `izi_jobs` on every tick -- wasted work at small
+  scale, row-lock contention and deadlock risk at larger ones. The lease lives
+  in a new `izi_peers` table (one row per scope) and is renewed with a single
+  renew-or-take-over statement that the database arbitrates; a leader that
+  stops renewing is replaced `ttl` seconds later, and a clean shutdown hands
+  the lease back immediately. Configure with `leadership: { name?, interval?,
+  ttl? }`, inspect with `IziQueue.isLeader()` / `getLeader()` (and a new
+  `isLeader` field on `getQueueStatus`), and observe with the new
+  `peer:elected`, `peer:lost` and `peer:error` telemetry events. Followers
+  keep polling, fetching and executing jobs exactly as before, and `drain()`
+  still stages regardless of leadership. Set `leadership: false` for the old
+  behavior; adapters that do not implement `acquireLeadership` get it
+  automatically. ([#26])
+- `DatabaseAdapter.acquireLeadership`, `releaseLeadership` and `getLeader`,
+  all optional so third-party adapters keep compiling.
+- `PluginContext.isLeader` and `BasePlugin.isLeader()`, for gating a custom
+  plugin's cluster-wide work the way `LifelinePlugin` and `PrunerPlugin` now
+  gate theirs.
+
+### Changed
+
+- `getQueueStatus`/`getAllQueueStatus` gained an `isLeader` field. Code
+  comparing the returned object with `toEqual` needs updating; property
+  access is unaffected.
+
+### Migrations
+
+- PostgreSQL v8, MySQL v7, SQLite v7 create `izi_peers`. They run
+  automatically on `migrate()`.
+
 ## [0.8.0] - 2026-08-17
 
 ### Changed
@@ -395,6 +432,7 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [#32]: https://github.com/iagocavalcante/izi-queue/issues/32
 [#34]: https://github.com/iagocavalcante/izi-queue/issues/34
 [#40]: https://github.com/iagocavalcante/izi-queue/issues/40
+[#26]: https://github.com/iagocavalcante/izi-queue/issues/26
 [0.4.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.3.0...v0.4.0
 [0.4.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.0...v0.4.1
 [0.5.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.4.1...v0.5.0

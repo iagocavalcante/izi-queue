@@ -1,4 +1,11 @@
-export { IziQueue, createIziQueue, type IziQueueFullConfig, type InsertResult } from './izi-queue.js';
+export {
+  IziQueue,
+  createIziQueue,
+  type IziQueueFullConfig,
+  type InsertResult,
+  type QueueStatus
+} from './izi-queue.js';
+export { Peer } from './peer.js';
 export { Queue } from './queue.js';
 export {
   createJob,

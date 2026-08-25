@@ -6,6 +6,7 @@ import type {
   JobListCriteria,
   JobState,
   JobStateCounts,
+  LeaderInfo,
   Logger,
   TransactionHandle,
   UniqueOptions
@@ -15,6 +16,7 @@ import {
   DEFAULT_BATCH_SIZE,
   DEFAULT_NODE_TTL,
   INSERT_JOB_COLUMNS,
+  SQL,
   buildStateCounts,
   chunkArray,
   criteriaClause,
@@ -38,6 +40,16 @@ import { sqliteMigrations } from './migrations.js';
  */
 const SQLITE_MAX_BIND_PARAMS = 32766;
 export const INSERT_JOBS_CHUNK_SIZE = maxRowsPerStatement(SQLITE_MAX_BIND_PARAMS);
+
+/**
+ * SQLite has no timestamp type: `datetime('now')` writes `YYYY-MM-DD HH:MM:SS`
+ * in UTC, and `new Date()` reads that space-separated form as *local* time.
+ * Normalising to ISO 8601 with an explicit `Z` is what keeps a leadership
+ * expiry from appearing hours out on any machine that is not on UTC.
+ */
+function parseSqliteTimestamp(value: string): Date {
+  return new Date(`${value.replace(' ', 'T')}Z`);
+}
 
 export class SQLiteAdapter extends BaseAdapter {
   private db: Database;
@@ -350,6 +362,41 @@ export class SQLiteAdapter extends BaseAdapter {
 
   async removeNode(node: string): Promise<void> {
     this.db.prepare('DELETE FROM izi_nodes WHERE name = ?').run(node);
+  }
+
+  /**
+   * See `BaseAdapter.electLeader`. Single-process SQLite has no real election
+   * to run, but implementing it keeps `leadership` behaving identically
+   * across adapters instead of silently degrading to "everyone leads" on the
+   * one adapter people develop against.
+   */
+  async acquireLeadership(name: string, node: string, ttlSeconds: number): Promise<boolean> {
+    return this.electLeader(
+      node,
+      async () =>
+        this.db.prepare(SQL.sqlite.renewLeadership).run(node, node, ttlSeconds, name, node).changes,
+      async () => {
+        this.db.prepare(SQL.sqlite.claimLeadership).run(name, node, ttlSeconds);
+      },
+      () => this.getLeader(name)
+    );
+  }
+
+  async releaseLeadership(name: string, node: string): Promise<void> {
+    this.db.prepare(SQL.sqlite.releaseLeadership).run(name, node);
+  }
+
+  async getLeader(name: string): Promise<LeaderInfo | null> {
+    const row = this.db.prepare(SQL.sqlite.getLeader).get(name) as
+      | { node: string; elected_at: string; expires_at: string }
+      | undefined;
+    if (!row) return null;
+
+    return {
+      node: row.node,
+      electedAt: parseSqliteTimestamp(row.elected_at),
+      expiresAt: parseSqliteTimestamp(row.expires_at)
+    };
   }
 
   private findUnique(uniqueKey: string, states: string[], period: number | null): Job | null {
