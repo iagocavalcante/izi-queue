@@ -8,6 +8,8 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-25
+
 ### Added
 
 - **Leader election.** One node per cluster is elected leader, and only the
@@ -464,4 +466,5 @@ production. Anyone running 0.3.0 or earlier should upgrade.
 [0.6.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.5.0...v0.6.0
 [0.7.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.6.0...v0.7.0
 [0.7.1]: https://github.com/iagocavalcante/izi-queue/compare/v0.7.0...v0.7.1
+[0.9.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/iagocavalcante/izi-queue/compare/v0.7.1...v0.8.0
