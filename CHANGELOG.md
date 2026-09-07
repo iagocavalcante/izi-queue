@@ -8,6 +8,42 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in cluster operations (`cluster: true`) with new `pauseClusterQueue`,
+  `resumeClusterQueue`, and `scaleClusterQueue` APIs and named-node targeting. Controls apply before startup polling and
+  survive missed notifications and restarts. PostgreSQL sends control hints
+  over its existing listener; participating nodes reconcile every `controlInterval`
+  (default 1000ms).
+- Remote cancellation for single jobs and bulk filters. Running nodes reconcile
+  active executions against persisted state. Isolated jobs waiting for a thread
+  can now be cancelled without starting, and their timeout covers the full wait
+  plus execution.
+- `getClusterStatus()` exposes node heartbeat timestamps and queue snapshots
+  (state, concurrency, running count, leadership), refreshed on heartbeats and
+  applied controls. MySQL timestamps use database epoch values to avoid driver
+  timezone conversion errors.
+- Cluster integration checks across SQLite, PostgreSQL, and MySQL, including
+  concurrent controls, cancellation/retry races, orphan recovery, missed
+  notifications, startup pauses, PostgreSQL listener reconnection, and separate
+  Node.js process cancellation and SIGKILL recovery.
+
+### Changed
+
+- Existing `pauseQueue`, `resumeQueue`, and `scaleQueue` remain synchronous and
+  local, with their 0.9.0 signatures and behavior. Cluster participation defaults
+  to off; existing applications work against the 0.9.0 schema without migrating.
+  Positive safe-integer validation applies only to the new cluster scale API.
+- Worker state transitions check the execution's attempt and owner as well as
+  its source state, preventing a stale worker from completing a newer retry.
+  Custom adapters should honor `updateJob`'s optional fourth argument.
+
+### Migrations
+
+- PostgreSQL v9, MySQL v8, SQLite v8 add `izi_queue_controls` and a queue snapshot
+  nullable column on `izi_nodes`. Run `migrate()` before enabling cluster features.
+  Existing 0.9.0 workers remain compatible with the additive schema changes.
+
 ## [0.9.0] - 2026-08-25
 
 ### Added

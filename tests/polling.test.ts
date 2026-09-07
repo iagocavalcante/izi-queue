@@ -34,6 +34,7 @@ describe('queue polling', () => {
   it('does not accumulate poll loops when dispatch() is called repeatedly', async () => {
     let fetchCalls = 0;
     const db = {
+      getJob: async (id: number) => createJobRow(id),
       fetchJobs: async () => {
         fetchCalls++;
         return [];
@@ -57,6 +58,7 @@ describe('queue polling', () => {
   it('stops polling once the queue is stopped', async () => {
     let fetchCalls = 0;
     const db = {
+      getJob: async (id: number) => createJobRow(id),
       fetchJobs: async () => {
         fetchCalls++;
         return [];
@@ -89,6 +91,7 @@ describe('queue polling', () => {
     );
 
     const db = {
+      getJob: async (id: number) => createJobRow(id),
       // A fetch already in flight when stop() is called.
       fetchJobs: async () => {
         await new Promise((r) => setTimeout(r, 80));
@@ -120,6 +123,7 @@ describe('queue polling', () => {
 
     let handed = false;
     const db = {
+      getJob: async (id: number) => createJobRow(id),
       fetchJobs: async () => {
         if (handed) return [];
         handed = true;
@@ -185,6 +189,7 @@ describe('queue polling', () => {
 
       let handed = false;
       const db = {
+      getJob: async (id: number) => createJobRow(id),
         fetchJobs: async () => {
           if (handed) return [];
           handed = true;
@@ -222,6 +227,7 @@ describe('queue polling', () => {
     );
 
     const db = {
+      getJob: async (id: number) => createJobRow(id),
       // Always hands back exactly as many jobs as asked for, like a saturated queue.
       fetchJobs: async (_queue: string, limit: number) =>
         Array.from({ length: limit }, () => createJobRow(nextId++)),

@@ -763,7 +763,7 @@ export abstract class BaseAdapter implements DatabaseAdapter {
   abstract migrate(): Promise<void>;
   abstract insertJob(job: Omit<Job, 'id' | 'insertedAt'>): Promise<Job>;
   abstract fetchJobs(queue: string, limit: number, node?: string): Promise<Job[]>;
-  abstract updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[]): Promise<Job | null>;
+  abstract updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[], execution?: import('../types.js').ExecutionIdentity): Promise<Job | null>;
   abstract getJob(id: number): Promise<Job | null>;
   abstract pruneJobs(maxAge: number, limit?: number): Promise<number>;
   abstract stageJobs(limit?: number): Promise<number>;
@@ -813,4 +813,37 @@ export abstract class BaseAdapter implements DatabaseAdapter {
     return { states, period };
   }
   abstract close(): Promise<void>;
+}
+
+/** Called under the queue row's write lock. A global command supersedes node overrides. */
+export function mergeQueueControl(
+  queue: string, raw: string, patch: import('../types.js').QueueControlPatch, node?: string
+): string {
+  // ponytail: one JSON row per queue (64 KiB on MySQL); normalize overrides if node counts outgrow it.
+  const control = JSON.parse(raw) as import('../types.js').QueueControl;
+  control.queue = queue;
+  control.revision = (control.revision ?? 0) + 1;
+  control.nodes ??= [];
+  if (node !== undefined) {
+    let target = control.nodes.find(entry => entry.node === node);
+    if (!target) control.nodes.push(target = { node });
+    Object.assign(target, patch);
+  } else {
+    Object.assign(control, patch);
+    for (const target of control.nodes) {
+      if (patch.paused !== undefined) delete target.paused;
+      if (patch.limit !== undefined) delete target.limit;
+    }
+    control.nodes = control.nodes.filter(target => target.paused !== undefined || target.limit !== undefined);
+  }
+  return JSON.stringify(control);
+}
+
+export function rowToClusterNode(row: Record<string, unknown>): import('../types.js').ClusterNodeStatus {
+  const date = (value: unknown): Date => value instanceof Date ? value :
+    new Date(String(value).replace(' ', 'T').replace(/Z?$/, 'Z'));
+  return {
+    node: String(row.name), startedAt: date(row.started_at), heartbeatAt: date(row.heartbeat_at),
+    queues: JSON.parse(String(row.queues))
+  };
 }

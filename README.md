@@ -499,9 +499,19 @@ wipe the queue when called with none of them. To act on every job, be explicit:
 await queue.cancelJobs({ all: true });
 ```
 
-Cancelling a job that is currently executing marks it cancelled and causes its
-result to be discarded when the worker finishes. It does **not** interrupt the
-worker mid-run ([#30](https://github.com/iagocavalcante/izi-queue/issues/30)).
+Cancellation marks the job in the database. With [cluster operations enabled](#cluster-controls-opt-in),
+the owning node also interrupts remote executions, including bulk cancellation
+by filters. Without that opt-in, local cancellation by job id retains 0.9.0 behavior. In-process workers receive
+an `AbortSignal`; pass it to abortable operations such as `fetch`. Workers that
+ignore the signal may continue their side effects. Isolated jobs terminate,
+including jobs waiting for a free worker thread. Old attempts cannot overwrite
+a cancelled job or a newer retry.
+
+```typescript
+queue.register(defineWorker('download', async (job, { signal }) => {
+  await fetch(job.args.url as string, { signal });
+}));
+```
 
 ## Transactional Inserts
 
@@ -593,6 +603,81 @@ const queue = new IziQueue({
 
 Staging and the built-in plugins run on one elected node rather than on all of
 them — see [Leader Election](#leader-election).
+
+### Cluster controls (opt-in)
+
+Existing `pauseQueue`, `resumeQueue`, and `scaleQueue` calls remain synchronous
+and local, exactly as in 0.9.0. Existing applications can keep using the 0.9.0
+schema without enabling cluster operations.
+
+To enable cluster operations, run `migrate()` and configure participating
+workers with `cluster: true`:
+
+```typescript
+const queue = new IziQueue({
+  database: adapter,
+  queues: { emails: 5 },
+  cluster: true,
+});
+await queue.migrate();
+await queue.start();
+
+// Existing local APIs: no await required.
+queue.pauseQueue('emails');
+queue.resumeQueue('emails');
+queue.scaleQueue('emails', 5);
+
+// New explicit APIs: persist controls for participating nodes.
+await queue.pauseClusterQueue('emails');
+await queue.resumeClusterQueue('emails');
+await queue.scaleClusterQueue('emails', 5); // Five jobs on EACH participating node
+await queue.pauseClusterQueue('emails', { node: 'worker-2' });
+await queue.scaleClusterQueue('emails', 2, { node: 'worker-2' });
+
+const nodes = await queue.getClusterStatus();
+// [{ node, startedAt, heartbeatAt, queues: [{ name, state, limit, running, isLeader }] }]
+```
+
+A resolved cluster control call means the desired state is persisted. A local
+instance with `cluster: true` also attempts to apply it; the call does not wait
+for remote acknowledgement. A pause prevents subsequent polling once applied;
+jobs already claimed or executing may finish. Scaling down lets existing jobs
+finish. The new cluster scale API requires a positive safe integer.
+
+Persisted controls apply before startup polling and survive restarts. Commands
+can be issued from an admin instance without starting it or opting into worker
+participation. Node-specific overrides persist for that node name. A later
+global pause/resume clears node pause overrides; a global scale clears node
+limit overrides. On participating nodes, local controls can be superseded by
+the next persisted command for that queue.
+
+Only nodes configured with `cluster: true` poll controls and active jobs for
+remote cancellation at `controlInterval` (default 1000ms). PostgreSQL also uses
+`LISTEN`/`NOTIFY` for prompt delivery; polling recovers missed notifications and
+database outages. MySQL and SQLite use polling. SQLite instances must share
+the same database file. The leadership `name` does not isolate jobs or controls
+into separate clusters.
+
+Enable `cluster: true` on cancellation callers to send notification hints and
+interrupt local jobs matching bulk filters. Without it, cancellation retains
+0.9.0 behavior: it updates database state and interrupts local jobs selected by
+id. Participating remote workers still observe cancelled rows through polling.
+
+Cluster snapshots refresh on participating nodes' heartbeats (default 15s) and
+applied controls. Check `heartbeatAt` before treating a snapshot as current.
+Nonparticipating nodes have no queue snapshots. Gracefully stopped nodes
+disappear; crashed nodes remain until stale-node cleanup removes them. Use
+distinct node names, and stable names when targeting a node across restarts.
+
+The migrations add a table and a nullable column, so 0.9.0 workers can keep
+using the migrated database. During a rolling upgrade, only upgraded workers
+with `cluster: true` respond to cluster controls and remote interruption.
+
+Custom adapters may keep their existing methods. New cluster APIs require
+`setQueueControl`/`getQueueControls` and `getClusterStatus`/`recordQueueStatus`;
+unsupported cluster calls throw. Honoring `updateJob`'s optional fourth
+execution identity argument additionally fences stale attempts. Built-in
+adapters implement these methods.
 
 Two caveats when scaling out:
 

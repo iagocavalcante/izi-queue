@@ -141,6 +141,22 @@ export const postgresMigrations: Migration[] = [
     down: [
       `DROP TABLE IF EXISTS izi_peers`
     ]
+  },
+  {
+    version: 9,
+    name: 'add_cluster_controls',
+    up: [
+      `CREATE TABLE IF NOT EXISTS izi_queue_controls (
+        queue VARCHAR(255) PRIMARY KEY,
+        settings TEXT NOT NULL
+      )`,
+      `ALTER TABLE izi_nodes ADD COLUMN queues TEXT`,
+      `UPDATE izi_nodes SET queues = '[]' WHERE queues IS NULL`
+    ],
+    down: [
+      `DROP TABLE IF EXISTS izi_queue_controls`,
+      `ALTER TABLE izi_nodes DROP COLUMN queues`
+    ]
   }
 ];
 
@@ -254,6 +270,22 @@ export const sqliteMigrations: Migration[] = [
     down: [
       `DROP TABLE IF EXISTS izi_peers`
     ]
+  },
+  {
+    version: 8,
+    name: 'add_cluster_controls',
+    up: [
+      `CREATE TABLE IF NOT EXISTS izi_queue_controls (
+        queue VARCHAR(255) PRIMARY KEY,
+        settings TEXT NOT NULL
+      )`,
+      `ALTER TABLE izi_nodes ADD COLUMN queues TEXT`,
+      `UPDATE izi_nodes SET queues = '[]' WHERE queues IS NULL`
+    ],
+    down: [
+      `DROP TABLE IF EXISTS izi_queue_controls`,
+      `ALTER TABLE izi_nodes DROP COLUMN queues`
+    ]
   }
 ];
 
@@ -364,6 +396,22 @@ export const mysqlMigrations: Migration[] = [
     ],
     down: [
       `DROP TABLE IF EXISTS izi_peers`
+    ]
+  },
+  {
+    version: 8,
+    name: 'add_cluster_controls',
+    up: [
+      `CREATE TABLE IF NOT EXISTS izi_queue_controls (
+        queue VARCHAR(255) PRIMARY KEY,
+        settings TEXT NOT NULL
+      )`,
+      `ALTER TABLE izi_nodes ADD COLUMN queues TEXT`,
+      `UPDATE izi_nodes SET queues = '[]' WHERE queues IS NULL`
+    ],
+    down: [
+      `DROP TABLE IF EXISTS izi_queue_controls`,
+      `ALTER TABLE izi_nodes DROP COLUMN queues`
     ]
   }
 ];

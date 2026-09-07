@@ -1,5 +1,10 @@
 import type { Database } from 'better-sqlite3';
 import type {
+  ClusterNodeStatus,
+  QueueControl,
+  QueueControlPatch,
+  QueueSnapshot,
+  ExecutionIdentity,
   BulkJobInsert,
   Job,
   JobCriteria,
@@ -12,6 +17,8 @@ import type {
   UniqueOptions
 } from '../types.js';
 import {
+  mergeQueueControl,
+  rowToClusterNode,
   BaseAdapter,
   DEFAULT_BATCH_SIZE,
   DEFAULT_NODE_TTL,
@@ -199,12 +206,14 @@ export class SQLiteAdapter extends BaseAdapter {
   async updateJob(
     id: number,
     updates: Partial<Job>,
-    expectedStates?: JobState[]
+    expectedStates?: JobState[],
+    execution?: ExecutionIdentity
   ): Promise<Job | null> {
-    const guard = expectedStates?.length
+    let guard = expectedStates?.length
       ? ` AND state IN (${expectedStates.map(() => '?').join(',')})`
       : '';
 
+    if (execution) guard += ' AND attempt = ? AND attempted_by IS ?';
     const stmt = this.db.prepare(`
       UPDATE izi_jobs
       SET state = COALESCE(?, state),
@@ -230,7 +239,8 @@ export class SQLiteAdapter extends BaseAdapter {
       updates.attempt ?? null,
       updates.maxAttempts ?? null,
       id,
-      ...(expectedStates ?? [])
+      ...(expectedStates ?? []),
+      ...(execution ? [execution.attempt, execution.attemptedBy] : [])
     );
 
     if (result.changes === 0) return null;
@@ -341,6 +351,29 @@ export class SQLiteAdapter extends BaseAdapter {
     `);
     const result = stmt.run(rescueAfter, nodeTtl);
     return result.changes;
+  }
+
+  async setQueueControl(queue: string, patch: QueueControlPatch, node?: string): Promise<void> {
+    this.db.transaction(() => {
+      this.db.prepare("INSERT INTO izi_queue_controls (queue, settings) VALUES (?, '{}') ON CONFLICT(queue) DO NOTHING").run(queue);
+      const row = this.db.prepare('SELECT settings FROM izi_queue_controls WHERE queue = ?').get(queue) as { settings: string };
+      this.db.prepare('UPDATE izi_queue_controls SET settings = ? WHERE queue = ?')
+        .run(mergeQueueControl(queue, row.settings, patch, node), queue);
+    }).immediate();
+  }
+
+  async getQueueControls(): Promise<QueueControl[]> {
+    const rows = this.db.prepare('SELECT settings FROM izi_queue_controls').all() as { settings: string }[];
+    return rows.map(row => JSON.parse(row.settings));
+  }
+
+  async recordQueueStatus(node: string, queues: QueueSnapshot[]): Promise<void> {
+    this.db.prepare('UPDATE izi_nodes SET queues = ? WHERE name = ?').run(JSON.stringify(queues), node);
+  }
+
+  async getClusterStatus(): Promise<ClusterNodeStatus[]> {
+    const rows = this.db.prepare("SELECT name, started_at, heartbeat_at, COALESCE(queues, '[]') AS queues FROM izi_nodes ORDER BY name").all() as Record<string, unknown>[];
+    return rows.map(rowToClusterNode);
   }
 
   async heartbeat(node: string): Promise<void> {

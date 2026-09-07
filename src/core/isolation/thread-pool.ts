@@ -41,6 +41,7 @@ interface PooledWorker {
 }
 
 interface Waiter {
+  jobId: number;
   limitsKey: string;
   limits?: ResourceLimits;
   resolve: (worker: PooledWorker | null) => void;
@@ -79,6 +80,7 @@ export class ThreadPool {
   }> = new Map();
   private cleanupInterval?: ReturnType<typeof setInterval>;
   private waiters: Waiter[] = [];
+  private queuedCancels = new Map<number, (result: WorkerResult) => void>();
   private shuttingDown = false;
 
   constructor(config: ThreadPoolConfig = {}) {
@@ -240,7 +242,7 @@ export class ThreadPool {
    * consume one of its retry attempts for something it had no part in, which is
    * easy to hit whenever a queue's concurrency exceeds `maxThreads`.
    */
-  private acquireWorker(limits: ResourceLimits | undefined, signal: { aborted: boolean }): Promise<PooledWorker | null> {
+  private acquireWorker(jobId: number, limits: ResourceLimits | undefined, signal: { aborted: boolean }): Promise<PooledWorker | null> {
     const limitsKey = limitsKeyFor(limits);
 
     const immediate = this.takeIdleWorker(limitsKey, limits);
@@ -248,6 +250,7 @@ export class ThreadPool {
 
     return new Promise<PooledWorker | null>(resolve => {
       const waiter: Waiter = {
+        jobId,
         limitsKey,
         limits,
         resolve: worker => {
@@ -345,26 +348,34 @@ export class ThreadPool {
       settle = resolve;
     });
 
-    const waitTimer = setTimeout(() => {
+    const deadline = Date.now() + timeout;
+    this.queuedCancels.set(job.id, result => {
       signal.aborted = true;
-      this.waiters = this.waiters.filter(w => w.resolve !== waiterResolve);
-      settle?.({
-        status: 'error',
-        error: new Error(`Timed out after ${timeout}ms waiting for a worker thread`)
+      const waiter = this.waiters.find(w => w.jobId === job.id);
+      this.waiters = this.waiters.filter(w => w.jobId !== job.id);
+      waiter?.resolve(null);
+      settle?.(result);
+    });
+    const waitTimer = setTimeout(() => {
+      this.queuedCancels.get(job.id)?.({
+        status: 'error', error: new Error(`Timed out after ${timeout}ms waiting for a worker thread`)
       });
     }, timeout);
 
-    const waiterResolve = (): void => {};
-
-    const pooled = await Promise.race([
-      this.acquireWorker(options.resourceLimits, signal),
-      settled.then(() => null)
-    ]);
-
-    clearTimeout(waitTimer);
+    let pooled: PooledWorker | null;
+    try {
+      pooled = await Promise.race([
+        this.acquireWorker(job.id, options.resourceLimits, signal),
+        settled.then(() => null)
+      ]);
+    } finally {
+      clearTimeout(waitTimer);
+      this.queuedCancels.delete(job.id);
+    }
 
     if (signal.aborted || !pooled) {
-      return settled;
+      if (pooled) { pooled.busy = false; this.handOffToWaiter(); }
+      return signal.aborted ? settled : { status: 'error', error: new Error('Thread pool shutdown') };
     }
 
     pooled.currentJobId = job.id;
@@ -396,7 +407,7 @@ export class ThreadPool {
             error: new Error(`Isolated job timed out after ${timeout}ms`)
           });
         }
-      }, timeout);
+      }, Math.max(0, deadline - Date.now()));
 
       this.pendingJobs.set(job.id, { resolve, reject: () => {}, timeoutId });
 
@@ -432,6 +443,8 @@ export class ThreadPool {
     jobId: number,
     result: WorkerResult = { status: 'error', error: new Error('Job terminated') }
   ): Promise<boolean> {
+    const cancelQueued = this.queuedCancels.get(jobId);
+    if (cancelQueued) { cancelQueued(result); return true; }
     for (const pooled of this.workers) {
       if (pooled.currentJobId === jobId) {
         const pending = this.pendingJobs.get(jobId);
@@ -453,6 +466,8 @@ export class ThreadPool {
 
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
+    for (const cancel of this.queuedCancels.values()) cancel({ status: 'error', error: new Error('Thread pool shutdown') });
+    this.queuedCancels.clear();
 
     // Nothing will free up now, so release anyone queued rather than leaving
     // their promises pending forever.

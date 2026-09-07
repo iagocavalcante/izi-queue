@@ -24,6 +24,11 @@ interface Pool {
   end(): Promise<void>;
 }
 import type {
+  ClusterNodeStatus,
+  QueueControl,
+  QueueControlPatch,
+  QueueSnapshot,
+  ExecutionIdentity,
   BulkJobInsert,
   Job,
   JobCriteria,
@@ -36,6 +41,8 @@ import type {
   UniqueOptions
 } from '../types.js';
 import {
+  mergeQueueControl,
+  rowToClusterNode,
   BaseAdapter,
   DEFAULT_BATCH_SIZE,
   DEFAULT_NODE_TTL,
@@ -247,7 +254,8 @@ export class MySQLAdapter extends BaseAdapter {
   async updateJob(
     id: number,
     updates: Partial<Job>,
-    expectedStates?: JobState[]
+    expectedStates?: JobState[],
+    execution?: ExecutionIdentity
   ): Promise<Job | null> {
     const params: unknown[] = [
       updates.state ?? null,
@@ -268,6 +276,10 @@ export class MySQLAdapter extends BaseAdapter {
       params.push(...expectedStates);
     }
 
+    if (execution) {
+      guard += ' AND attempt = ? AND attempted_by <=> ?';
+      params.push(execution.attempt, execution.attemptedBy);
+    }
     const [result] = await this.pool.query<ResultSetHeader>(
       `
         UPDATE izi_jobs
@@ -360,6 +372,38 @@ export class MySQLAdapter extends BaseAdapter {
       nodeTtl
     ]);
     return result.affectedRows;
+  }
+
+  async setQueueControl(queue: string, patch: QueueControlPatch, node?: string): Promise<void> {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.query(`INSERT INTO izi_queue_controls (queue, settings) VALUES (?, '{}')
+        ON DUPLICATE KEY UPDATE queue = VALUES(queue)`, [queue]);
+      const [rows] = await connection.query<RowDataPacket[]>('SELECT settings FROM izi_queue_controls WHERE queue = ? FOR UPDATE', [queue]);
+      await connection.query('UPDATE izi_queue_controls SET settings = ? WHERE queue = ?',
+        [mergeQueueControl(queue, String(rows[0].settings), patch, node), queue]);
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally { connection.release(); }
+  }
+
+  async getQueueControls(): Promise<QueueControl[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>('SELECT settings FROM izi_queue_controls');
+    return rows.map(row => JSON.parse(String(row.settings)));
+  }
+
+  async recordQueueStatus(node: string, queues: QueueSnapshot[]): Promise<void> {
+    await this.pool.query('UPDATE izi_nodes SET queues = ? WHERE name = ?', [JSON.stringify(queues), node]);
+  }
+
+  async getClusterStatus(): Promise<ClusterNodeStatus[]> {
+    const [rows] = await this.pool.query<RowDataPacket[]>("SELECT name, UNIX_TIMESTAMP(started_at) * 1000 AS started_ms, UNIX_TIMESTAMP(heartbeat_at) * 1000 AS heartbeat_ms, COALESCE(queues, '[]') AS queues FROM izi_nodes ORDER BY name");
+    return rows.map(row => rowToClusterNode({
+      ...row, started_at: new Date(Number(row.started_ms)), heartbeat_at: new Date(Number(row.heartbeat_ms))
+    }));
   }
 
   async heartbeat(node: string): Promise<void> {
