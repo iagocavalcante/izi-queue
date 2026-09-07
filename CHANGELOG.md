@@ -10,6 +10,12 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ### Added
 
+- Framework-independent testing helpers under `izi-queue/testing`: `buildJob`,
+  `performJob`, `allEnqueued`, `assertEnqueued`, and `refuteEnqueued`. Direct worker
+  tests use the existing timeout/isolation execution path without changing the
+  global registry. Enqueue assertions support nested JSON subsets, pagination,
+  and bounded waits. No existing APIs, defaults, or schema requirements change.
+
 - Opt-in cluster operations (`cluster: true`) with new `pauseClusterQueue`,
   `resumeClusterQueue`, and `scaleClusterQueue` APIs and named-node targeting. Controls apply before startup polling and
   survive missed notifications and restarts. PostgreSQL sends control hints

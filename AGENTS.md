@@ -639,3 +639,17 @@ reads use `UNIX_TIMESTAMP` to avoid the driver's local timezone interpretation.
 `tests/cluster.test.ts` runs the same contract against independent connections
 to a shared SQLite file and isolated PostgreSQL/MySQL test schemas/databases,
 including a separate Node.js process that is controlled, cancelled, and killed.
+
+
+### Testing helpers
+
+`izi-queue/testing` is a separate package export, implemented in `src/testing.ts`.
+Keep it framework-independent (Node assertions) and additive: do not change
+runtime defaults or introduce a global testing mode. `performJob` passes an
+explicit definition to `executeWorker` instead of temporarily modifying the
+worker registry; temporary registration races when tests use the same name.
+Enqueue assertions reuse `listJobs`, include available/scheduled jobs only, and
+must scan every page before claiming there is no match. Reuse `IziQueue.drain`
+with queues paused from startup for application tests. Isolated worker tests
+must shut down the shared pool explicitly. The ESM consumer fixture checks the
+public subpath through the built package using only Node's assertion library.

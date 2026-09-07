@@ -39,6 +39,7 @@ A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](ht
 - [Running Multiple Nodes](#running-multiple-nodes)
 - [Worker Results](#worker-results)
 - [Database Support](#database-support)
+- [Testing](#testing)
 - [Examples](#examples)
 - [Contributing](#contributing)
 - [License](#license)
@@ -723,6 +724,91 @@ Driver versions covered by the test suite: `better-sqlite3` 11-13, `pg` 8, `mysq
 express that: **v12 requires Node 20+ and v13 requires Node 22+**. On Node 18,
 stay on `better-sqlite3` 11 — a newer driver installs but crashes the process
 with a segmentation fault rather than failing cleanly.
+
+## Testing
+
+Import the optional helpers from `izi-queue/testing`. They use Node's
+`AssertionError`, so they work with `node:test`, Jest, Vitest, or another runner.
+Existing runtime behavior is unchanged; no testing mode or new migration is
+required.
+
+Test a worker directly without a database:
+
+```typescript
+import assert from 'node:assert/strict';
+import { defineWorker } from 'izi-queue';
+import { buildJob, performJob } from 'izi-queue/testing';
+
+const double = defineWorker('double', async job => ({
+  status: 'ok', value: Number(job.args.n) * 2,
+}));
+
+const job = buildJob(double, { n: 3 }, { attempt: 2 });
+assert.equal(job.attempt, 2);
+assert.deepEqual(await performJob(double, { n: 3 }), { status: 'ok', value: 6 });
+```
+
+`buildJob` supplies worker defaults, timestamps, an executing state, attempt 1,
+and a distinct negative id. It JSON-normalizes args and metadata as persistence
+would. Pass options to override queue, priority, max attempts, schedule, id, or
+attempt. Both helpers accept a worker definition or an already registered name.
+Passing a definition never registers or replaces a global worker.
+
+`performJob` runs one attempt through the usual timeout and isolation code,
+returns its `WorkerResult`, and fails on invalid results. A thrown worker error
+becomes `{ status: 'error', error }`, just as in production. It neither inserts a
+job nor retries, snoozes, or schedules follow-up work automatically. If testing
+isolated workers, call the existing `shutdownIsolatedWorkers()` in suite cleanup
+to close the thread pool.
+
+For application tests, use an isolated test database and keep queues paused from
+startup. The helpers accept an `IziQueue` instance or an adapter with `listJobs`:
+
+```typescript
+import assert from 'node:assert/strict';
+import { IziQueue, defineWorker } from 'izi-queue';
+import { allEnqueued, assertEnqueued, refuteEnqueued } from 'izi-queue/testing';
+
+const queue = new IziQueue({
+  database: adapter, // Your test database adapter
+  queues: [{ name: 'default', limit: 1, paused: true }],
+});
+queue.register(defineWorker('send-email', async () => {}));
+await queue.migrate();
+await queue.start();
+try {
+  await queue.insert('send-email', { args: { user: { id: 42, name: 'Iago' } } });
+  await assertEnqueued(queue, { worker: 'send-email', args: { user: { id: 42 } } });
+  assert.equal((await allEnqueued(queue)).length, 1);
+  assert.equal((await queue.drain()).success, 1);
+  await refuteEnqueued(queue);
+} finally {
+  await queue.stop();
+  await adapter.close();
+}
+```
+
+Assertions match available and scheduled jobs; use `listJobs` for executing,
+retryable, or terminal states. Supported filters are ids, queue, worker, tags
+(match-any), priority, args, and metadata. Objects match recursively as subsets;
+arrays and scalar values match exactly. `allEnqueued` reads every page, newest
+first. `assertEnqueued` returns the matching job; `refuteEnqueued` returns nothing.
+
+Assertions check once by default. To observe asynchronous insertion, pass a
+bounded timeout in milliseconds:
+
+```typescript
+await assertEnqueued(queue, { worker: 'send-email' }, { timeout: 500 });
+await refuteEnqueued(queue, { worker: 'unexpected' }, { timeout: 100 });
+```
+
+Positive assertions return when a match appears. Negative assertions observe the
+full timeout window and fail as soon as a match appears. Polling defaults to
+10ms and uses real timers. Keep consumers paused while asserting: these helpers
+observe current database state, not a history of jobs already processed. Reads
+through a PostgreSQL/MySQL pool do not see an uncommitted insert on another
+connection. Omit production plugins from these test instances; pausing queues
+only pauses job polling, not maintenance or plugins.
 
 ## Examples
 
