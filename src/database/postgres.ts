@@ -1,5 +1,11 @@
 import type { Pool, PoolClient } from 'pg';
 import type {
+  DatabaseNotification,
+  ClusterNodeStatus,
+  QueueControl,
+  QueueControlPatch,
+  QueueSnapshot,
+  ExecutionIdentity,
   BulkJobInsert,
   Job,
   JobCriteria,
@@ -12,6 +18,8 @@ import type {
   UniqueOptions
 } from '../types.js';
 import {
+  mergeQueueControl,
+  rowToClusterNode,
   BaseAdapter,
   DEFAULT_BATCH_SIZE,
   DEFAULT_NODE_TTL,
@@ -59,7 +67,7 @@ export class PostgresAdapter extends BaseAdapter {
   private client?: PoolClient;
   private listening = false;
   private resubscribing = false;
-  private notificationHandler?: (event: { queue: string }) => void;
+  private notificationHandler?: (event: DatabaseNotification) => void;
   private reconnecting = false;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 10;
@@ -242,7 +250,8 @@ export class PostgresAdapter extends BaseAdapter {
   async updateJob(
     id: number,
     updates: Partial<Job>,
-    expectedStates?: JobState[]
+    expectedStates?: JobState[],
+    execution?: ExecutionIdentity
   ): Promise<Job | null> {
     const params: unknown[] = [
       id,
@@ -261,6 +270,11 @@ export class PostgresAdapter extends BaseAdapter {
     if (expectedStates?.length) {
       params.push(expectedStates);
       guard = ` AND state = ANY($${params.length})`;
+    }
+
+    if (execution) {
+      params.push(execution.attempt, execution.attemptedBy);
+      guard += ` AND attempt = $${params.length - 1} AND attempted_by IS NOT DISTINCT FROM $${params.length}`;
     }
 
     const result = await this.pool.query(
@@ -352,6 +366,36 @@ export class PostgresAdapter extends BaseAdapter {
   async rescueStuckJobs(rescueAfter: number, nodeTtl = DEFAULT_NODE_TTL): Promise<number> {
     const result = await this.pool.query(SQL.postgres.rescueStuckJobs, [rescueAfter, nodeTtl]);
     return result.rowCount ?? 0;
+  }
+
+  async setQueueControl(queue: string, patch: QueueControlPatch, node?: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`INSERT INTO izi_queue_controls (queue, settings) VALUES ($1, '{}')
+        ON CONFLICT(queue) DO UPDATE SET queue = EXCLUDED.queue`, [queue]);
+      const { rows } = await client.query('SELECT settings FROM izi_queue_controls WHERE queue = $1', [queue]);
+      await client.query('UPDATE izi_queue_controls SET settings = $2 WHERE queue = $1',
+        [queue, mergeQueueControl(queue, rows[0].settings, patch, node)]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally { client.release(); }
+  }
+
+  async getQueueControls(): Promise<QueueControl[]> {
+    const { rows } = await this.pool.query('SELECT settings FROM izi_queue_controls');
+    return rows.map(row => JSON.parse(row.settings));
+  }
+
+  async recordQueueStatus(node: string, queues: QueueSnapshot[]): Promise<void> {
+    await this.pool.query('UPDATE izi_nodes SET queues = $2 WHERE name = $1', [node, JSON.stringify(queues)]);
+  }
+
+  async getClusterStatus(): Promise<ClusterNodeStatus[]> {
+    const { rows } = await this.pool.query("SELECT name, started_at, heartbeat_at, COALESCE(queues, '[]') AS queues FROM izi_nodes ORDER BY name");
+    return rows.map(rowToClusterNode);
   }
 
   async heartbeat(node: string): Promise<void> {
@@ -570,7 +614,7 @@ export class PostgresAdapter extends BaseAdapter {
     }
   }
 
-  async listen(callback: (event: { queue: string }) => void): Promise<void> {
+  async listen(callback: (event: DatabaseNotification) => void): Promise<void> {
     if (this.listening) return;
 
     this.listening = true;
@@ -595,6 +639,7 @@ export class PostgresAdapter extends BaseAdapter {
     client.on('end', () => this.resubscribe());
 
     client.on('notification', msg => {
+      if (msg.channel === 'izi_queue_control') this.notificationHandler?.({ queue: '', control: true });
       if (msg.channel === 'izi_jobs_insert' && msg.payload) {
         try {
           const payload = JSON.parse(msg.payload);
@@ -606,6 +651,7 @@ export class PostgresAdapter extends BaseAdapter {
     });
 
     await client.query('LISTEN izi_jobs_insert');
+    await client.query('LISTEN izi_queue_control');
   }
 
   private async resubscribe(): Promise<void> {
@@ -643,6 +689,10 @@ export class PostgresAdapter extends BaseAdapter {
     }
 
     this.resubscribing = false;
+  }
+
+  async notifyControl(): Promise<void> {
+    await this.pool.query("SELECT pg_notify('izi_queue_control', '')");
   }
 
   async notify(queue: string, tx?: TransactionHandle): Promise<void> {

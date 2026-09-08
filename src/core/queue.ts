@@ -1,4 +1,4 @@
-import type { DatabaseAdapter, DrainOutcome, Job, Logger, QueueConfig } from '../types.js';
+import type { DatabaseAdapter, DrainOutcome, Job, Logger, QueueConfig, QueueControlPatch } from '../types.js';
 import { formatError, sourceStatesFor } from './job.js';
 import { executeWorker, getBackoffDelay, hasWorker, getWorker, terminateIsolatedJob } from './worker.js';
 import { telemetry } from './telemetry.js';
@@ -11,6 +11,7 @@ export class Queue {
   private database: DatabaseAdapter;
   private state: QueueState = 'stopped';
   private running: Map<number, Promise<void>> = new Map();
+  private activeJobs: Map<number, Job> = new Map();
   private isolatedJobs: Set<number> = new Set();
   private abortControllers: Map<number, AbortController> = new Map();
   private pollTimer?: ReturnType<typeof setTimeout>;
@@ -125,6 +126,36 @@ export class Queue {
     this.config.limit = limit;
   }
 
+  applyControl(patch: QueueControlPatch): void {
+    if (patch.limit !== undefined) this.scale(patch.limit);
+    if (patch.paused !== undefined) {
+      this.config.paused = patch.paused;
+      if (patch.paused) this.pause();
+      else this.resume();
+    }
+  }
+
+  /** Compare executions, not just states: cancellation may already have been retried. */
+  async reconcileRunning(): Promise<void> {
+    const active = Array.from(this.activeJobs.values());
+    for (let i = 0; i < active.length; i += 1000) {
+      const batch = active.slice(i, i + 1000);
+      const rows = this.database.listJobs
+        ? await this.database.listJobs({ ids: batch.map(job => job.id), limit: 1000 })
+        : (await Promise.all(batch.map(job => this.database.getJob(job.id)))).filter((job): job is Job => job !== null);
+      const current = new Map(rows.map(job => [job.id, job]));
+      for (const job of batch) {
+        // A new attempt may already occupy the same id locally by the time the read returns.
+        if (this.activeJobs.get(job.id) !== job) continue;
+        if (!this.ownsExecution(job, current.get(job.id))) await this.cancelRunning(job.id);
+      }
+    }
+  }
+
+  private ownsExecution(job: Job, current?: Job | null): boolean {
+    return current?.state === 'executing' && current.attempt === job.attempt && current.attemptedBy === job.attemptedBy;
+  }
+
   dispatch(): void {
     if (this.state !== 'running') return;
     this.poll();
@@ -155,22 +186,7 @@ export class Queue {
     return this.runJob(job);
   }
 
-  /**
-   * Interrupts `jobId` if it is currently executing on this node: fires its
-   * `AbortSignal` for an in-process worker, or pre-emptively kills its
-   * worker thread for an isolated one. Returns whether the job was actually
-   * found running here.
-   *
-   * This is necessarily local. A job executing on another node cannot be
-   * reached from here -- there is no signal to fire and no thread to kill --
-   * so `IziQueue.cancelJob` calls this on every queue on every node's own
-   * `IziQueue` instance, and each one is a no-op except on the node that
-   * actually has the job. The database row is cancelled regardless (by the
-   * caller, before this runs); the #35 state-transition guard is what stops
-   * the other node's worker from resurrecting it once it finishes on its own.
-   * Building a cross-node "stop now" signal (e.g. over LISTEN/NOTIFY) is
-   * future work, not attempted here.
-   */
+  /** Interrupts this node's execution after the owning IziQueue observes cancellation. */
   async cancelRunning(jobId: number): Promise<boolean> {
     const controller = this.abortControllers.get(jobId);
     if (controller) {
@@ -181,14 +197,6 @@ export class Queue {
     }
 
     if (this.isolatedJobs.has(jobId)) {
-      // Only kills a thread already running the job. If the pool is
-      // saturated and the job is still queued waiting for one (added to
-      // `isolatedJobs` before that wait begins), `ThreadPool.terminate` finds
-      // nothing to kill and this is a no-op -- the job runs once a thread
-      // frees up, same as before this feature, and the state-transition
-      // guard still keeps it from resurrecting the cancelled row. Reaching
-      // into the pool's wait queue to pre-empt a not-yet-started job would
-      // need `Waiter` to carry a jobId; left as a follow-up.
       return terminateIsolatedJob(jobId, { status: 'cancel', reason: 'Job cancelled' });
     }
 
@@ -242,9 +250,12 @@ export class Queue {
       const jobs = await this.database.fetchJobs(this.name, available, this.node);
 
       for (const job of jobs) {
-        const promise = this.execute(job);
+        // A cancelled job can be retried before its cooperative worker has settled.
+        const promise = this.execute(job, this.running.get(job.id));
         this.running.set(job.id, promise);
-        promise.finally(() => this.running.delete(job.id));
+        promise.finally(() => {
+          if (this.running.get(job.id) === promise) this.running.delete(job.id);
+        });
       }
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
@@ -253,8 +264,9 @@ export class Queue {
     }
   }
 
-  private async execute(job: Job): Promise<void> {
+  private async execute(job: Job, previous?: Promise<void>): Promise<void> {
     try {
+      await previous;
       await this.runJob(job);
     } catch (error) {
       // Recording the outcome failed (a dropped connection, a closing pool).
@@ -269,13 +281,17 @@ export class Queue {
   private async runJob(job: Job): Promise<DrainOutcome> {
     const startTime = Date.now();
 
+    // A cancel can commit after fetch but before the executor receives the row.
+    if (!this.ownsExecution(job, await this.database.getJob(job.id))) return 'cancelled';
+    this.activeJobs.set(job.id, job);
     telemetry.emit('job:start', { job, queue: this.name });
 
     if (!hasWorker(job.worker)) {
       // Deterministic: no number of retries will make the worker appear on this
       // node, so retrying only occupies fetch slots for hours before the job is
       // discarded anyway.
-      await this.handleUnknownWorker(job, startTime);
+      try { await this.handleUnknownWorker(job, startTime); }
+      finally { this.activeJobs.delete(job.id); }
       return 'discarded';
     }
 
@@ -318,6 +334,7 @@ export class Queue {
         startTime
       );
     } finally {
+      this.activeJobs.delete(job.id);
       this.isolatedJobs.delete(job.id);
       this.abortControllers.delete(job.id);
     }
@@ -336,7 +353,8 @@ export class Queue {
     const updated = await this.database.updateJob(
       job.id,
       { state: to, ...updates },
-      sourceStatesFor(to)
+      sourceStatesFor(to),
+      job
     );
 
     if (!updated) {

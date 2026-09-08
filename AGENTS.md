@@ -610,3 +610,46 @@ Stubbing `Date.now` directly hangs the run -- jest's own timing reads it.
 - **Clear every timer you create**: the timeout race in `executeWorker` and the
   grace-period race in `Queue.stop()` both leaked until fixed, each holding the
   event loop open long after its work was done.
+
+
+### Cluster operations
+
+`pauseQueue`/`resumeQueue`/`scaleQueue` must remain synchronous and local, with
+their 0.9.0 behavior. New `pauseClusterQueue`/`resumeClusterQueue`/`scaleClusterQueue`
+methods persist desired state by queue in `izi_queue_controls`. Each adapter locks the row before calling
+`mergeQueueControl`, so independent concurrent patches cannot erase one another.
+Global commands clear node overrides only for the changed field. Node targeting
+uses exact names. `cluster: true` opts a node into reconciliation and snapshots;
+it defaults to false so existing runtimes need no new tables or columns.
+
+`IziQueue` reconciles revisions and running-job state every `controlInterval`.
+PostgreSQL's `izi_queue_control` notification is only a hint to reconcile sooner.
+Never rely on notification delivery for correctness. Apply controls before
+starting queue pollers, and stop/await reconciliation before stopping queues.
+
+A source-state guard alone cannot fence a cancelled-and-retried job that is
+`executing` again. `Queue.transition` also passes the original attempt and owner
+to `updateJob`; all three adapters enforce them in SQL. Cancellation scans use
+the same identity, and isolated cancellation must handle queued jobs as well as
+threads already running them.
+
+Queue snapshots live in `izi_nodes.queues` and refresh with heartbeats and
+applied controls. They are observations, not acknowledgements. MySQL status
+reads use `UNIX_TIMESTAMP` to avoid the driver's local timezone interpretation.
+`tests/cluster.test.ts` runs the same contract against independent connections
+to a shared SQLite file and isolated PostgreSQL/MySQL test schemas/databases,
+including a separate Node.js process that is controlled, cancelled, and killed.
+
+
+### Testing helpers
+
+`izi-queue/testing` is a separate package export, implemented in `src/testing.ts`.
+Keep it framework-independent (Node assertions) and additive: do not change
+runtime defaults or introduce a global testing mode. `performJob` passes an
+explicit definition to `executeWorker` instead of temporarily modifying the
+worker registry; temporary registration races when tests use the same name.
+Enqueue assertions reuse `listJobs`, include available/scheduled jobs only, and
+must scan every page before claiming there is no match. Reuse `IziQueue.drain`
+with queues paused from startup for application tests. Isolated worker tests
+must shut down the shared pool explicitly. The ESM consumer fixture checks the
+public subpath through the built package using only Node's assertion library.

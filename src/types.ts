@@ -260,7 +260,7 @@ export type WorkerResult =
 
 /**
  * Passed as the second argument to `perform`. `signal` fires when the job is
- * cancelled while executing on this node (via `cancelJob`/`cancelJobs`) or
+ * cancelled on any node (via `cancelJob`/`cancelJobs`) or
  * when the job's own timeout elapses. A worker that threads `signal` through
  * to abortable operations (e.g. `fetch(url, { signal })`) stops promptly
  * instead of running to completion for a result that will be discarded.
@@ -316,6 +316,45 @@ export interface WorkerDefinition<T = Record<string, unknown>> {
   backoff?: ((job: Job<T>) => number) | BackoffOptions;
   timeout?: number;
   isolation?: IsolatedWorkerOptions;
+}
+
+export interface QueueControlOptions {
+  /** Target a named node. Omit to apply to all nodes, including future nodes. */
+  node?: string;
+}
+
+export interface QueueControlPatch {
+  paused?: boolean;
+  limit?: number;
+}
+
+/** Persisted desired state. Global commands clear node overrides for their field. */
+export interface QueueControl extends QueueControlPatch {
+  queue: string;
+  revision: number;
+  nodes: Array<QueueControlPatch & { node: string }>;
+}
+
+export interface QueueSnapshot {
+  name: string;
+  state: string;
+  limit: number;
+  running: number;
+  isLeader: boolean;
+}
+
+export interface ClusterNodeStatus {
+  node: string;
+  startedAt: Date;
+  heartbeatAt: Date;
+  /** Snapshot from the last heartbeat or applied control, not a live RPC. */
+  queues: QueueSnapshot[];
+}
+
+export type ExecutionIdentity = Pick<Job, 'attempt' | 'attemptedBy'>;
+export interface DatabaseNotification {
+  queue: string;
+  control?: boolean;
 }
 
 export interface QueueConfig {
@@ -382,9 +421,10 @@ export interface DatabaseAdapter {
    * Applies `updates` to a job. When `expectedStates` is given the database
    * arbitrates the transition: the write only lands if the job is still in one
    * of those states, and `null` is returned otherwise. That check has to happen
-   * in the database, because the race is between nodes.
+   * in the database, because the race is between nodes. `execution` additionally
+   * fences stale attempts after a cancelled job has been retried.
    */
-  updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[]): Promise<Job | null>;
+  updateJob(id: number, updates: Partial<Job>, expectedStates?: JobState[], execution?: ExecutionIdentity): Promise<Job | null>;
   getJob(id: number): Promise<Job | null>;
   /**
    * Deletes at most `limit` prunable (completed/discarded/cancelled, past
@@ -424,6 +464,13 @@ export interface DatabaseAdapter {
    * without a heartbeat before it is presumed dead.
    */
   rescueStuckJobs(rescueAfter: number, nodeTtl?: number): Promise<number>;
+  /** Atomically update desired queue state, serializing concurrent commands. */
+  setQueueControl?(queue: string, patch: QueueControlPatch, node?: string): Promise<void>;
+  getQueueControls?(): Promise<QueueControl[]>;
+  recordQueueStatus?(node: string, queues: QueueSnapshot[]): Promise<void>;
+  getClusterStatus?(): Promise<ClusterNodeStatus[]>;
+  /** A hint only: persisted state must also be polled. */
+  notifyControl?(): Promise<void>;
   /** Registers/refreshes this node's liveness record. */
   heartbeat?(node: string): Promise<void>;
   /** Removes a node's liveness record on graceful shutdown. */
@@ -489,7 +536,7 @@ export interface DatabaseAdapter {
     tx?: TransactionHandle
   ): Promise<{ job: Job; conflict: boolean }[]>;
   close(): Promise<void>;
-  listen?(callback: (event: { queue: string }) => void): Promise<void>;
+  listen?(callback: (event: DatabaseNotification) => void): Promise<void>;
   /**
    * Wakes queues for `queue`. When a transaction is supplied the notification
    * must not be observable before it commits.
@@ -522,6 +569,10 @@ export interface IziQueueConfig {
    * jobs become eligible for rescue.
    */
   heartbeatInterval?: number;
+  /** Poll persisted controls and running-job cancellation, in ms. Default 1000. */
+  controlInterval?: number;
+  /** Opt into persisted controls, remote cancellation and status reporting. Requires new migrations. Default false. */
+  cluster?: boolean;
   pollInterval?: number;
   isolation?: IsolationConfig;
   /**

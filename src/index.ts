@@ -89,6 +89,13 @@ export {
 
 // Types
 export type {
+  QueueControlOptions,
+  QueueControlPatch,
+  QueueControl,
+  QueueSnapshot,
+  ClusterNodeStatus,
+  ExecutionIdentity,
+  DatabaseNotification,
   Job,
   JobState,
   JobError,

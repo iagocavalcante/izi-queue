@@ -1,4 +1,7 @@
 import type {
+  ClusterNodeStatus,
+  QueueControlOptions,
+  QueueControlPatch,
   BulkJobInsert,
   DatabaseAdapter,
   DrainResult,
@@ -86,6 +89,11 @@ export class IziQueue {
   private stageTimer?: ReturnType<typeof setInterval>;
   private heartbeatTimer?: ReturnType<typeof setInterval>;
   private started = false;
+  private controlActive = false;
+  private controlTimer?: ReturnType<typeof setInterval>;
+  private controlInFlight?: Promise<void>;
+  private controlRevisions = new Map<string, number>();
+  private heartbeatInFlight?: Promise<void>;
 
   constructor(config: IziQueueFullConfig) {
     const queues = Array.isArray(config.queues)
@@ -106,12 +114,17 @@ export class IziQueue {
       stageBatchSize: config.stageBatchSize ?? DEFAULT_BATCH_SIZE,
       shutdownGracePeriod: config.shutdownGracePeriod ?? 15000,
       heartbeatInterval: config.heartbeatInterval ?? 15000,
+      cluster: config.cluster ?? false,
+      controlInterval: config.controlInterval ?? 1000,
       pollInterval: config.pollInterval ?? 1000,
       isolation: config.isolation,
       leadership: config.leadership ?? true,
       logger: config.logger ?? consoleLogger
     };
 
+    if (!Number.isSafeInteger(this.config.controlInterval) || this.config.controlInterval <= 0) {
+      throw new Error('controlInterval must be a positive integer');
+    }
     // Constructed here rather than in `start()` so a misconfigured lease
     // (a TTL shorter than the renewal interval, say) is rejected while the
     // caller is still wiring things up, alongside plugin validation below.
@@ -190,6 +203,13 @@ export class IziQueue {
   async start(): Promise<void> {
     if (this.started) return;
 
+    this.controlRevisions.clear();
+    for (const queueConfig of this.config.queues) {
+      this.queues.set(queueConfig.name, new Queue(this.config.cluster ? { ...queueConfig } : queueConfig, this.database, this.node, this.config.logger));
+    }
+    // Apply durable pauses before starting any poller, including after restart.
+    if (this.config.cluster) await this.applyQueueControls();
+
     // Register before any job can be claimed, otherwise this node's first jobs
     // are owned by a node that the rescuer has never heard of.
     await this.recordHeartbeat();
@@ -204,11 +224,6 @@ export class IziQueue {
     // one interval.
     await this.peer.start();
 
-    for (const queueConfig of this.config.queues) {
-      const queue = new Queue(queueConfig, this.config.database, this.config.node, this.config.logger);
-      this.queues.set(queueConfig.name, queue);
-    }
-
     this.stageTimer = setInterval(
       () => this.stageJobsIfLeader(),
       this.config.stageInterval
@@ -219,8 +234,9 @@ export class IziQueue {
     );
 
     if (this.config.database.listen) {
-      await this.config.database.listen(({ queue }) => {
-        this.queues.get(queue)?.dispatch();
+      await this.config.database.listen(({ queue, control }) => {
+        if (control) void this.syncCluster();
+        else this.queues.get(queue)?.dispatch();
       });
     }
 
@@ -239,10 +255,20 @@ export class IziQueue {
     }
 
     this.started = true;
+    if (this.config.cluster) {
+      this.controlActive = true;
+      await this.syncCluster();
+      await this.recordHeartbeat();
+      this.controlTimer = setInterval(() => void this.syncCluster(), this.config.controlInterval);
+    }
   }
 
   async stop(): Promise<void> {
     if (!this.started) return;
+    this.controlActive = false;
+    if (this.controlTimer) clearInterval(this.controlTimer);
+    this.controlTimer = undefined;
+    await this.controlInFlight;
 
     for (const plugin of this.config.plugins) {
       await plugin.stop();
@@ -271,17 +297,27 @@ export class IziQueue {
 
     // Deregister only after the grace period: anything still executing at this
     // point really has been abandoned and should become rescuable promptly.
+    await this.heartbeatInFlight;
     await this.removeNodeRecord();
 
     this.started = false;
   }
 
-  private async recordHeartbeat(): Promise<void> {
-    try {
-      await this.config.database.heartbeat?.(this.config.node);
-    } catch (error) {
-      this.config.logger.error('Error recording node heartbeat', { error, node: this.config.node });
-    }
+  private recordHeartbeat(): Promise<void> {
+    if (this.heartbeatInFlight) return this.heartbeatInFlight;
+    this.heartbeatInFlight = (async () => {
+      try {
+        await this.database.heartbeat?.(this.node);
+        await this.recordQueueStatus();
+      } catch (error) {
+        this.config.logger.error('Error recording node heartbeat', { error, node: this.node });
+      }
+    })().finally(() => { this.heartbeatInFlight = undefined; });
+    return this.heartbeatInFlight;
+  }
+
+  private async recordQueueStatus(): Promise<void> {
+    if (this.config.cluster) await this.database.recordQueueStatus?.(this.node, this.getAllQueueStatus());
   }
 
   private async removeNodeRecord(): Promise<void> {
@@ -617,18 +653,13 @@ export class IziQueue {
     assertScoped(criteria, 'cancelJobs');
     const count = await this.config.database.cancelJobs(criteria);
 
-    // Best-effort local interruption, only possible when the caller told us
-    // which ids were targeted. `cancelJobs` reports how many rows it
-    // changed, not which ones, so a queue/worker/state-scoped call has no
-    // way to know which jobs to interrupt without an extra query -- out of
-    // scope here. Every queue on this node is asked regardless of which one
-    // (if any) actually has the job; each is a no-op unless it does.
-    if (count > 0 && criteria.ids && criteria.ids.length > 0) {
-      await Promise.all(
-        criteria.ids.flatMap(id =>
-          Array.from(this.queues.values()).map(queue => queue.cancelRunning(id))
-        )
-      );
+    if (count > 0 && this.config.cluster) {
+      await this.interruptCancelledJobs();
+      await this.notifyControl();
+    } else if (count > 0 && criteria.ids?.length) {
+      await Promise.all(criteria.ids.flatMap(id =>
+        Array.from(this.queues.values()).map(queue => queue.cancelRunning(id))
+      ));
     }
 
     return count;
@@ -681,6 +712,7 @@ export class IziQueue {
     return this.config.database.rescueStuckJobs(rescueAfterSeconds, this.nodeTtl);
   }
 
+  /** Synchronous, local controls, unchanged from 0.9.0. */
   pauseQueue(name: string): void {
     this.queues.get(name)?.pause();
   }
@@ -691,6 +723,86 @@ export class IziQueue {
 
   scaleQueue(name: string, limit: number): void {
     this.queues.get(name)?.scale(limit);
+  }
+
+  /** Persist a pause for participating nodes. Await persistence, not remote acknowledgement. */
+  async pauseClusterQueue(name: string, options: QueueControlOptions = {}): Promise<void> {
+    await this.controlQueue(name, { paused: true }, options);
+  }
+
+  async resumeClusterQueue(name: string, options: QueueControlOptions = {}): Promise<void> {
+    await this.controlQueue(name, { paused: false }, options);
+  }
+
+  /** Sets each targeted node's concurrency; this is not a global concurrency limit. */
+  async scaleClusterQueue(name: string, limit: number, options: QueueControlOptions = {}): Promise<void> {
+    if (!Number.isSafeInteger(limit) || limit <= 0) throw new Error('limit must be a positive integer');
+    await this.controlQueue(name, { limit }, options);
+  }
+
+  private async controlQueue(name: string, patch: QueueControlPatch, options: QueueControlOptions): Promise<void> {
+    if (typeof name !== 'string' || !name.length || name.length > 255) throw new Error('queue must contain 1–255 characters');
+    if (options.node !== undefined && (typeof options.node !== 'string' || !options.node.length || options.node.length > 255)) {
+      throw new Error('node must contain 1–255 characters');
+    }
+    if (!this.database.setQueueControl || !this.database.getQueueControls) {
+      throw new Error('The configured database adapter does not support cluster controls');
+    }
+    await this.database.setQueueControl(name, patch, options.node);
+    // Finish any pre-commit read before requesting our own fresh reconciliation.
+    await this.controlInFlight;
+    await this.syncCluster();
+    await this.notifyControl();
+  }
+
+  async getClusterStatus(): Promise<ClusterNodeStatus[]> {
+    if (!this.database.getClusterStatus) throw new Error('The configured database adapter does not support cluster status');
+    return this.database.getClusterStatus();
+  }
+
+  private async notifyControl(): Promise<void> {
+    try { await this.database.notifyControl?.(); }
+    catch (error) {
+      // The command is already committed. Polling recovers a lost hint.
+      this.config.logger.warn('Cluster notification failed; polling will recover', { error });
+    }
+  }
+
+  private async applyQueueControls(): Promise<boolean> {
+    const controls = await this.database.getQueueControls?.() ?? [];
+    let changed = false;
+    for (const control of controls) {
+      const queue = this.queues.get(control.queue);
+      if (!queue || this.controlRevisions.get(control.queue) === control.revision) continue;
+      const target = control.nodes.find(entry => entry.node === this.node);
+      queue.applyControl({
+        paused: target?.paused ?? control.paused,
+        limit: target?.limit ?? control.limit
+      });
+      this.controlRevisions.set(control.queue, control.revision);
+      changed = true;
+    }
+    return changed;
+  }
+
+  private async interruptCancelledJobs(): Promise<void> {
+    await Promise.all(Array.from(this.queues.values()).map(queue => queue.reconcileRunning()));
+  }
+
+  /** One bounded pass at a time. Hints arriving during a pass fall back to polling. */
+  private syncCluster(): Promise<void> {
+    if (!this.controlActive) return Promise.resolve();
+    if (this.controlInFlight) return this.controlInFlight;
+    this.controlInFlight = (async () => {
+      try {
+        const changed = await this.applyQueueControls();
+        await this.interruptCancelledJobs();
+        if (changed) await this.recordQueueStatus();
+      } catch (error) {
+        this.config.logger.error('Error reconciling cluster state', { error, node: this.node });
+      }
+    })().finally(() => { this.controlInFlight = undefined; });
+    return this.controlInFlight;
   }
 
   getQueueStatus(name: string): QueueStatus | null {

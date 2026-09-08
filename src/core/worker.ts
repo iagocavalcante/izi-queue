@@ -33,7 +33,8 @@ export function clearWorkers(): void {
 }
 
 /**
- * Runs `job`'s worker. `controller` -- owned by the caller, typically
+ * Runs `job`'s worker. An explicit definition lets testing helpers avoid mutating
+ * the global registry. Existing callers resolve the worker by name. `controller` -- owned by the caller, typically
  * `Queue`, so it can be reached and aborted from outside this call while it
  * is still in flight -- is only meaningful for in-process workers: isolated
  * (worker-thread) jobs cannot receive a live signal across the thread
@@ -41,8 +42,11 @@ export function clearWorkers(): void {
  * supplied one is created locally, which keeps this function usable on its
  * own (as the tests for it do) without a caller that tracks cancellation.
  */
-export async function executeWorker(job: Job, controller?: AbortController): Promise<WorkerResult> {
-  const worker = getWorker(job.worker);
+export async function executeWorker(
+  job: Job,
+  controller?: AbortController,
+  worker: WorkerDefinition | undefined = getWorker(job.worker)
+): Promise<WorkerResult> {
 
   if (!worker) {
     return {
