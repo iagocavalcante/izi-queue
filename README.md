@@ -4,7 +4,7 @@
 [![npm version](https://img.shields.io/npm/v/izi-queue.svg)](https://www.npmjs.com/package/izi-queue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Node.js Version](https://img.shields.io/node/v/izi-queue.svg)](https://nodejs.org)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.3+-blue.svg)](https://www.typescriptlang.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-6.0-blue.svg)](https://www.typescriptlang.org/)
 
 A minimal, reliable, database-backed job queue for Node.js inspired by [Oban](https://github.com/sorentwo/oban).
 
@@ -718,7 +718,7 @@ async perform(job) {
 
 **MySQL requires 8.0.1 or later** for `FOR UPDATE SKIP LOCKED`. MariaDB does not implement it and is not supported.
 
-Driver versions covered by the test suite: `better-sqlite3` 11-13, `pg` 8, `mysql2` 3.
+Driver versions covered by the test suite: `better-sqlite3` 11-13, `pg` 8, `mysql2` 3.23.1 or later in the 3.x line.
 
 `better-sqlite3` and Node have interlocking floors, and the peer range cannot
 express that: **v12 requires Node 20+ and v13 requires Node 22+**. On Node 18,

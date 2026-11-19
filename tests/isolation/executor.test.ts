@@ -170,6 +170,22 @@ describe('Isolation Executor', () => {
       }
     });
 
+    it('cancels only the selected execution when running and queued IDs overlap', async () => {
+      initializeIsolation({ maxThreads: 1 });
+      const runningJob = createMockJob({ id: 1, args: { action: 'delay', delay: 10000 } });
+      const queuedJob = createMockJob({ id: 1, args: { action: 'success' } });
+      const options = createIsolationOptions();
+      const running = executeIsolated(runningJob, options, 30000);
+      const queued = executeIsolated(queuedJob, options, 30000);
+
+      expect(await terminateIsolatedJob(1)).toBe(false);
+      const cancelled = { status: 'cancel', reason: 'Queued job cancelled' } as const;
+      expect(await terminateIsolatedJob(queuedJob, cancelled)).toBe(true);
+      expect(await queued).toEqual(cancelled);
+      expect(await terminateIsolatedJob(runningJob)).toBe(true);
+      expect((await running).status).toBe('error');
+    });
+
     it('should be a no-op if job does not exist', async () => {
       initializeIsolation({ maxThreads: 2 });
 

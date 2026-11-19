@@ -85,6 +85,12 @@ describe('criteriaClause', () => {
     expect(params).toEqual([]);
   });
 
+  it.each([{ queue: {} }, { worker: [] }, { ids: ['1'] }, { tags: [{}] }, { state: 'available' }])(
+    'rejects malformed filters (%p) before building SQL', criteria => {
+      expect(() => criteriaClause(criteria as JobCriteria, numbered, 'mysql')).toThrow(TypeError);
+    }
+  );
+
   it('combines ids/queue/worker/state into one AND-ed clause with sequential placeholders', () => {
     const criteria: JobCriteria = {
       ids: [1, 2],
@@ -158,6 +164,10 @@ describe('orderByClause', () => {
     expect(() =>
       orderByClause({ field: 'args' as never, direction: 'asc' })
     ).toThrow(/invalid listJobs orderBy\.field/);
+  });
+
+  it('requires an own property of the sort field map', () => {
+    expect(() => orderByClause({ field: 'constructor' as never })).toThrow(/orderBy\.field/);
   });
 
   it('rejects a direction outside asc/desc even if TypeScript is bypassed', () => {

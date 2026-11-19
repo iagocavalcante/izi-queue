@@ -36,6 +36,26 @@ function jobData(overrides: Partial<Omit<Job, 'id' | 'insertedAt'>> = {}): Omit<
   };
 }
 
+describe('MySQL advisory lock failures', () => {
+  it.each([0, null])('rejects protected operations when the lock result is %p', async acquired => {
+    const connection = {
+      query: jest.fn(async (sql: string) => {
+        if (sql.includes('GET_LOCK')) return [[{ acquired }], []];
+        if (sql.includes('RELEASE_LOCK') || sql.startsWith('SET TRANSACTION')) return [[], []];
+        throw new Error(`Unexpected SQL: ${sql}`);
+      }),
+      beginTransaction: jest.fn(), rollback: jest.fn(async () => {}), release: jest.fn()
+    };
+    const adapter = createMySQLAdapter({ getConnection: async () => connection } as never);
+    const job = jobData();
+    await expect(adapter.migrate()).rejects.toThrow(/could not acquire/);
+    await expect(adapter.rollback()).rejects.toThrow(/could not acquire/);
+    await expect(adapter.insertUnique(job, {})).rejects.toThrow(/could not acquire/);
+    await expect(adapter.insertJobs([{ job, unique: {} }])).rejects.toThrow(/could not acquire/);
+    expect(connection.release).toHaveBeenCalledTimes(4);
+  });
+});
+
 describeMySQL('MySQLAdapter', () => {
   let pool: mysql.Pool;
   let adapter: MySQLAdapter;
@@ -483,6 +503,17 @@ describeMySQL('MySQLAdapter', () => {
 
       const [rows] = await pool.query<mysql.RowDataPacket[]>('SELECT COUNT(*) AS c FROM izi_jobs');
       expect(Number(rows[0].c)).toBe(2);
+    });
+
+    it('returns the same unique job to concurrent batches that have already read plain jobs', async () => {
+      const batches = await Promise.all(Array.from({ length: 8 }, () => adapter.insertJobs([
+        { job: jobData({ worker: 'Plain' }) },
+        { job: jobData({ worker: 'Shared' }), unique: {} }
+      ])));
+
+      const unique = batches.map(batch => batch[1]);
+      expect(unique.filter(result => !result.conflict)).toHaveLength(1);
+      expect(new Set(unique.map(result => result.job.id)).size).toBe(1);
     });
 
     it('does not conflate distinct unique entries inserted in the same batch', async () => {

@@ -300,12 +300,15 @@ describe('job lifecycle', () => {
       const job = await queue.insert('W', { args: {} });
 
       await expect(queue.cancelJobs({})).rejects.toThrow(/criteri/i);
-      // The rejected call must not have touched anything.
+      await expect(queue.cancelJobs({ all: 'false' as never })).rejects.toThrow(/criteri/i);
+      await expect(adapter.cancelJobs({})).rejects.toThrow(/criteri/i);
       expect((await queue.getJob(job.id))?.state).toBe('available');
 
       const cancelled = await queue.cancelJobs({ all: true });
       expect(cancelled).toBe(1);
+      await expect(adapter.retryJobs({ ids: [] })).rejects.toThrow(/criteri/i);
       expect((await queue.getJob(job.id))?.state).toBe('cancelled');
+      expect(await adapter.retryJobs({ all: true })).toBe(1);
     });
 
     it('returns a discarded job to the queue', async () => {

@@ -53,15 +53,15 @@ export async function executeIsolated(
   }
 
   const serializedJob = serializeJob(job);
-  return threadPool!.execute(serializedJob, options, timeout);
+  return threadPool!.execute(serializedJob, options, timeout, job);
 }
 
 export async function terminateIsolatedJob(
-  jobId: number,
+  job: number | Job,
   result?: WorkerResult
 ): Promise<boolean> {
   if (!threadPool) return false;
-  return threadPool.terminate(jobId, result);
+  return threadPool.terminate(job, result);
 }
 
 export async function shutdownIsolation(): Promise<void> {

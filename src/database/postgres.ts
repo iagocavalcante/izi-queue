@@ -314,7 +314,7 @@ export class PostgresAdapter extends BaseAdapter {
   }
 
   async cancelJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, i => `$${i}`, 'postgres');
+    const { clause, params } = criteriaClause(criteria, i => `$${i}`, 'postgres', 'cancelJobs');
     const result = await this.pool.query(
       `${SQL.postgres.cancelJobs}${clause}`,
       params
@@ -323,7 +323,7 @@ export class PostgresAdapter extends BaseAdapter {
   }
 
   async retryJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, i => `$${i}`, 'postgres');
+    const { clause, params } = criteriaClause(criteria, i => `$${i}`, 'postgres', 'retryJobs');
     // Raising max_attempts matters for jobs discarded after exhausting them:
     // without headroom the job is discarded again on its very next fetch.
     const result = await this.pool.query(
