@@ -135,7 +135,7 @@ export async function shutdownIsolatedWorkers(): Promise<void> {
 }
 
 /**
- * Pre-emptively kills the worker thread running `jobId`, if any. `result` is
+ * Pass the original job to target its execution, or a numeric ID when it is unambiguous. `result` is
  * what the job's still-pending `executeWorker` call resolves with -- callers
  * cancelling a job pass `{ status: 'cancel', ... }` so it settles the same
  * way an in-process worker's own cancel result would; `Queue.stop()`'s
@@ -144,10 +144,10 @@ export async function shutdownIsolatedWorkers(): Promise<void> {
  * Returns whether a thread running that job was actually found and killed.
  */
 export async function terminateIsolatedJob(
-  jobId: number,
+  job: number | Job,
   result?: WorkerResult
 ): Promise<boolean> {
-  return terminateIsolated(jobId, result);
+  return terminateIsolated(job, result);
 }
 
 export { getIsolationStats };

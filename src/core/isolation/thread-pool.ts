@@ -27,11 +27,16 @@ function getWorkerThreadPath(): string {
 
 let WORKER_THREAD_PATH: string;
 
+// A database ID can occur in several queues or attempts sharing this pool.
+interface Execution {
+  owner: Pick<SerializableJob, 'id'>;
+}
+
 interface PooledWorker {
   worker: Worker;
   busy: boolean;
   lastUsed: number;
-  currentJobId: number | null;
+  execution: Execution | null;
   /**
    * Resource limits are fixed when a thread is created, so a worker can only
    * serve jobs asking for the same ones. This key partitions the pool.
@@ -41,7 +46,7 @@ interface PooledWorker {
 }
 
 interface Waiter {
-  jobId: number;
+  execution: Execution;
   limitsKey: string;
   limits?: ResourceLimits;
   resolve: (worker: PooledWorker | null) => void;
@@ -73,14 +78,14 @@ const DEFAULT_CONFIG: Required<ThreadPoolConfig> = {
 export class ThreadPool {
   private config: Required<ThreadPoolConfig>;
   private workers: PooledWorker[] = [];
-  private pendingJobs: Map<number, {
+  private pendingJobs: Map<Execution, {
     resolve: (result: WorkerResult) => void;
     reject: (error: Error) => void;
     timeoutId: ReturnType<typeof setTimeout>;
   }> = new Map();
   private cleanupInterval?: ReturnType<typeof setInterval>;
   private waiters: Waiter[] = [];
-  private queuedCancels = new Map<number, (result: WorkerResult) => void>();
+  private queuedCancels = new Map<Execution, (result: WorkerResult) => void>();
   private shuttingDown = false;
 
   constructor(config: ThreadPoolConfig = {}) {
@@ -130,7 +135,7 @@ export class ThreadPool {
       worker,
       busy: false,
       lastUsed: Date.now(),
-      currentJobId: null,
+      execution: null,
       limitsKey: limitsKeyFor(limits),
       limits
     };
@@ -152,48 +157,32 @@ export class ThreadPool {
   }
 
   private handleWorkerMessage(pooled: PooledWorker, message: WorkerThreadMessage): void {
-    if (message.type === 'result' && message.jobId !== undefined) {
-      const pending = this.pendingJobs.get(message.jobId);
-      if (pending) {
-        clearTimeout(pending.timeoutId);
-        this.pendingJobs.delete(message.jobId);
-        pooled.busy = false;
-        pooled.lastUsed = Date.now();
-        pooled.currentJobId = null;
+    const execution = pooled.execution;
+    if (!execution || message.jobId !== execution.owner.id) return;
+    if (message.type !== 'result' && message.type !== 'error') return;
 
-        if (message.result) {
-          pending.resolve(message.result);
-        } else {
-          pending.resolve({ status: 'ok' });
-        }
+    const pending = this.pendingJobs.get(execution);
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    this.pendingJobs.delete(execution);
+    pooled.busy = false;
+    pooled.lastUsed = Date.now();
+    pooled.execution = null;
 
-        this.handOffToWaiter();
-      }
-    } else if (message.type === 'error' && message.jobId !== undefined) {
-      const pending = this.pendingJobs.get(message.jobId);
-      if (pending) {
-        clearTimeout(pending.timeoutId);
-        this.pendingJobs.delete(message.jobId);
-        pooled.busy = false;
-        pooled.lastUsed = Date.now();
-        pooled.currentJobId = null;
-
-        pending.resolve({
-          status: 'error',
-          error: new Error(message.error || 'Unknown worker error')
-        });
-
-        this.handOffToWaiter();
-      }
+    if (message.type === 'error') {
+      pending.resolve({ status: 'error', error: new Error(message.error || 'Unknown worker error') });
+    } else {
+      pending.resolve(message.result ?? { status: 'ok' });
     }
+    this.handOffToWaiter();
   }
 
   private handleWorkerError(pooled: PooledWorker, error: Error): void {
-    if (pooled.currentJobId !== null) {
-      const pending = this.pendingJobs.get(pooled.currentJobId);
+    if (pooled.execution !== null) {
+      const pending = this.pendingJobs.get(pooled.execution);
       if (pending) {
         clearTimeout(pending.timeoutId);
-        this.pendingJobs.delete(pooled.currentJobId);
+        this.pendingJobs.delete(pooled.execution);
         pending.resolve({
           status: 'error',
           error
@@ -212,11 +201,11 @@ export class ThreadPool {
   }
 
   private handleWorkerExit(pooled: PooledWorker, code: number): void {
-    if (pooled.currentJobId !== null) {
-      const pending = this.pendingJobs.get(pooled.currentJobId);
+    if (pooled.execution !== null) {
+      const pending = this.pendingJobs.get(pooled.execution);
       if (pending) {
         clearTimeout(pending.timeoutId);
-        this.pendingJobs.delete(pooled.currentJobId);
+        this.pendingJobs.delete(pooled.execution);
         pending.resolve({
           status: 'error',
           error: new Error(`Worker thread exited unexpectedly with code ${code}`)
@@ -242,7 +231,7 @@ export class ThreadPool {
    * consume one of its retry attempts for something it had no part in, which is
    * easy to hit whenever a queue's concurrency exceeds `maxThreads`.
    */
-  private acquireWorker(jobId: number, limits: ResourceLimits | undefined, signal: { aborted: boolean }): Promise<PooledWorker | null> {
+  private acquireWorker(execution: Execution, limits: ResourceLimits | undefined, signal: { aborted: boolean }): Promise<PooledWorker | null> {
     const limitsKey = limitsKeyFor(limits);
 
     const immediate = this.takeIdleWorker(limitsKey, limits);
@@ -250,7 +239,7 @@ export class ThreadPool {
 
     return new Promise<PooledWorker | null>(resolve => {
       const waiter: Waiter = {
-        jobId,
+        execution,
         limitsKey,
         limits,
         resolve: worker => {
@@ -331,7 +320,8 @@ export class ThreadPool {
   async execute(
     job: SerializableJob,
     options: IsolatedWorkerOptions,
-    timeout: number
+    timeout: number,
+    owner: Pick<SerializableJob, 'id'> = job
   ): Promise<WorkerResult> {
     if (this.shuttingDown) {
       return {
@@ -342,6 +332,7 @@ export class ThreadPool {
 
     // The deadline covers queueing as well as execution, so a saturated pool
     // cannot leave a job outstanding indefinitely.
+    const execution: Execution = { owner };
     const signal = { aborted: false };
     let settle: ((result: WorkerResult) => void) | undefined;
     const settled = new Promise<WorkerResult>(resolve => {
@@ -349,15 +340,15 @@ export class ThreadPool {
     });
 
     const deadline = Date.now() + timeout;
-    this.queuedCancels.set(job.id, result => {
+    this.queuedCancels.set(execution, result => {
       signal.aborted = true;
-      const waiter = this.waiters.find(w => w.jobId === job.id);
-      this.waiters = this.waiters.filter(w => w.jobId !== job.id);
+      const waiter = this.waiters.find(w => w.execution === execution);
+      this.waiters = this.waiters.filter(w => w.execution !== execution);
       waiter?.resolve(null);
       settle?.(result);
     });
     const waitTimer = setTimeout(() => {
-      this.queuedCancels.get(job.id)?.({
+      this.queuedCancels.get(execution)?.({
         status: 'error', error: new Error(`Timed out after ${timeout}ms waiting for a worker thread`)
       });
     }, timeout);
@@ -365,12 +356,12 @@ export class ThreadPool {
     let pooled: PooledWorker | null;
     try {
       pooled = await Promise.race([
-        this.acquireWorker(job.id, options.resourceLimits, signal),
+        this.acquireWorker(execution, options.resourceLimits, signal),
         settled.then(() => null)
       ]);
     } finally {
       clearTimeout(waitTimer);
-      this.queuedCancels.delete(job.id);
+      this.queuedCancels.delete(execution);
     }
 
     if (signal.aborted || !pooled) {
@@ -378,19 +369,13 @@ export class ThreadPool {
       return signal.aborted ? settled : { status: 'error', error: new Error('Thread pool shutdown') };
     }
 
-    pooled.currentJobId = job.id;
-
-    telemetry.emit('job:isolated:start', {
-      job: job as unknown as import('../../types.js').Job,
-      threadId: pooled.worker.threadId,
-      isolated: true
-    });
+    pooled.execution = execution;
 
     return new Promise<WorkerResult>(resolve => {
       const timeoutId = setTimeout(() => {
-        const pending = this.pendingJobs.get(job.id);
+        const pending = this.pendingJobs.get(execution);
         if (pending) {
-          this.pendingJobs.delete(job.id);
+          this.pendingJobs.delete(execution);
 
           telemetry.emit('job:isolated:timeout', {
             job: job as unknown as import('../../types.js').Job,
@@ -409,7 +394,7 @@ export class ThreadPool {
         }
       }, Math.max(0, deadline - Date.now()));
 
-      this.pendingJobs.set(job.id, { resolve, reject: () => {}, timeoutId });
+      this.pendingJobs.set(execution, { resolve, reject: () => {}, timeoutId });
 
       const message: WorkerThreadMessage = {
         type: 'execute',
@@ -419,11 +404,16 @@ export class ThreadPool {
       };
 
       pooled.worker.postMessage(message);
+      telemetry.emit('job:isolated:start', {
+        job: job as unknown as import('../../types.js').Job,
+        threadId: pooled.worker.threadId,
+        isolated: true
+      });
     });
   }
 
   /**
-   * Pre-emptively kills the worker thread running `jobId`, if one is found.
+   * Cancels the matching execution, including one still waiting for a thread.
    * `result` is what the job's pending `execute()` promise resolves with --
    * defaults to the same "terminated" error it always has, for callers (the
    * shutdown grace-period timeout) unrelated to cancellation.
@@ -440,21 +430,26 @@ export class ThreadPool {
    * down.
    */
   async terminate(
-    jobId: number,
+    job: number | Pick<SerializableJob, 'id'>,
     result: WorkerResult = { status: 'error', error: new Error('Job terminated') }
   ): Promise<boolean> {
-    const cancelQueued = this.queuedCancels.get(jobId);
+    const matches = [...this.queuedCancels.keys(), ...this.pendingJobs.keys()].filter(
+      ({ owner }) => typeof job === 'number' ? owner.id === job : owner === job
+    );
+    if (matches.length !== 1) return false;
+    const [execution] = matches;
+    const cancelQueued = this.queuedCancels.get(execution);
     if (cancelQueued) { cancelQueued(result); return true; }
     for (const pooled of this.workers) {
-      if (pooled.currentJobId === jobId) {
-        const pending = this.pendingJobs.get(jobId);
+      if (pooled.execution === execution) {
+        const pending = this.pendingJobs.get(execution);
         if (pending) {
           clearTimeout(pending.timeoutId);
-          this.pendingJobs.delete(jobId);
+          this.pendingJobs.delete(execution);
           pending.resolve(result);
         }
 
-        pooled.currentJobId = null;
+        pooled.execution = null;
         this.terminateWorker(pooled);
         this.removeWorker(pooled);
         this.handOffToWaiter();

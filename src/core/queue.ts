@@ -12,7 +12,7 @@ export class Queue {
   private state: QueueState = 'stopped';
   private running: Map<number, Promise<void>> = new Map();
   private activeJobs: Map<number, Job> = new Map();
-  private isolatedJobs: Set<number> = new Set();
+  private isolatedJobs = new Set<Job>();
   private abortControllers: Map<number, AbortController> = new Map();
   private pollTimer?: ReturnType<typeof setTimeout>;
   private polling = false;
@@ -92,8 +92,8 @@ export class Queue {
       }
 
       if (result === 'timeout' && this.isolatedJobs.size > 0) {
-        const terminatePromises = Array.from(this.isolatedJobs).map(jobId =>
-          terminateIsolatedJob(jobId).catch(() => {})
+        const terminatePromises = Array.from(this.isolatedJobs).map(job =>
+          terminateIsolatedJob(job).catch(() => {})
         );
         await Promise.all(terminatePromises);
       }
@@ -196,8 +196,9 @@ export class Queue {
       return true;
     }
 
-    if (this.isolatedJobs.has(jobId)) {
-      return terminateIsolatedJob(jobId, { status: 'cancel', reason: 'Job cancelled' });
+    const job = this.activeJobs.get(jobId);
+    if (job && this.isolatedJobs.has(job)) {
+      return terminateIsolatedJob(job, { status: 'cancel', reason: 'Job cancelled' });
     }
 
     return false;
@@ -300,7 +301,7 @@ export class Queue {
 
     let controller: AbortController | undefined;
     if (isIsolated) {
-      this.isolatedJobs.add(job.id);
+      this.isolatedJobs.add(job);
     } else {
       controller = new AbortController();
       this.abortControllers.set(job.id, controller);
@@ -335,7 +336,7 @@ export class Queue {
       );
     } finally {
       this.activeJobs.delete(job.id);
-      this.isolatedJobs.delete(job.id);
+      this.isolatedJobs.delete(job);
       this.abortControllers.delete(job.id);
     }
   }

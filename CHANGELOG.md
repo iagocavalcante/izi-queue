@@ -10,6 +10,7 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ### Security
 
+- Isolated jobs that share a database ID keep independent results, timeouts, and cancellations in the shared thread pool.
 - Bulk cancellations and retries require a filter or the boolean `all: true` through both the queue and built-in adapters. Database queries reject malformed filters and unknown sort fields.
 - The optional MySQL driver now requires `mysql2` 3.23.1 or later in the 3.x line.
 - The Fastify example uses Fastify 5, requires Node.js 22 or later, and listens on loopback.

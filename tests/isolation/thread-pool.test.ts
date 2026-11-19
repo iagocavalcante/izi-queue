@@ -69,6 +69,16 @@ describe('ThreadPool', () => {
       }
     });
 
+    it('delivers each result to its caller when two jobs share a database ID', async () => {
+      pool = new ThreadPool({ maxThreads: 2 });
+      const jobs = ['first', 'second'].map(action => createSerializableJob({ id: 1, args: { action } }));
+      const results = await Promise.all(jobs.map(job => pool.execute(job, createIsolationOptions(), 5000)));
+      expect(results.map(r => r.status === 'ok' && r.value)).toEqual([
+        { action: 'first', args: { action: 'first' } },
+        { action: 'second', args: { action: 'second' } }
+      ]);
+    });
+
     it('should handle worker errors', async () => {
       pool = new ThreadPool({ maxThreads: 2 });
 
