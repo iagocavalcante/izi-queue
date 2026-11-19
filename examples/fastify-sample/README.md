@@ -2,6 +2,8 @@
 
 A sample Fastify application demonstrating izi-queue with SQLite for background job processing.
 
+The demo requires Node.js 22 or later. Its queue administration endpoints are unauthenticated and listen on the local loopback interface.
+
 ## Setup
 
 ```bash

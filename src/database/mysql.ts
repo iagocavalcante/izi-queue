@@ -63,6 +63,13 @@ import { computeUniqueKey } from '../core/unique.js';
 /** Arbitrary but fixed: all izi-queue instances must agree on this value. */
 const MIGRATION_LOCK_NAME = 'izi_queue_migrations';
 
+async function acquireLock(connection: PoolConnection, name: string, timeout: number): Promise<void> {
+  const [rows] = await connection.query<RowDataPacket[]>('SELECT GET_LOCK(?, ?) AS acquired', [name, timeout]);
+  if (Number(rows[0]?.acquired) !== 1) {
+    throw new Error(`izi-queue: could not acquire MySQL lock ${name}`);
+  }
+}
+
 /**
  * mysql2's `.query()` (used throughout this adapter, unlike `.execute()`)
  * interpolates values into the SQL text client-side rather than binding them
@@ -86,12 +93,16 @@ export class MySQLAdapter extends BaseAdapter {
   }
 
   async migrate(): Promise<void> {
+    await this.withMigrationLock(connection => this.runMigrations(connection));
+  }
+
+  private async withMigrationLock(operation: (connection: PoolConnection) => Promise<void>): Promise<void> {
     const connection = await this.pool.getConnection();
     try {
       // Serialises concurrent boots; without it two instances racing the same
       // version both apply it and the second fails on the primary key.
-      await connection.query('SELECT GET_LOCK(?, ?)', [MIGRATION_LOCK_NAME, 60]);
-      await this.runMigrations(connection);
+      await acquireLock(connection, MIGRATION_LOCK_NAME, 60);
+      await operation(connection);
     } finally {
       await connection.query('SELECT RELEASE_LOCK(?)', [MIGRATION_LOCK_NAME]).catch(() => {});
       connection.release();
@@ -133,17 +144,17 @@ export class MySQLAdapter extends BaseAdapter {
   }
 
   async rollback(targetVersion = 0): Promise<void> {
-    const [rows] = await this.pool.query<RowDataPacket[]>(
-      'SELECT version FROM izi_migrations WHERE version > ? ORDER BY version DESC',
-      [targetVersion]
-    );
+    await this.withMigrationLock(async connection => {
+      const [rows] = await connection.query<RowDataPacket[]>(
+        'SELECT version FROM izi_migrations WHERE version > ? ORDER BY version DESC',
+        [targetVersion]
+      );
 
-    for (const row of rows) {
-      const migration = mysqlMigrations.find(m => m.version === row.version);
-      if (migration?.down) {
+      for (const row of rows) {
+        const migration = mysqlMigrations.find(m => m.version === row.version);
+        if (!migration?.down) continue;
         this.logger.info('Rolling back migration', { version: migration.version, name: migration.name });
 
-        const connection = await this.pool.getConnection();
         try {
           await connection.beginTransaction();
           for (const statement of migration.down) {
@@ -154,11 +165,9 @@ export class MySQLAdapter extends BaseAdapter {
         } catch (error) {
           await connection.rollback();
           throw error;
-        } finally {
-          connection.release();
         }
       }
-    }
+    });
   }
 
   async getMigrationStatus(): Promise<{ version: number; name: string; applied: boolean }[]> {
@@ -317,7 +326,7 @@ export class MySQLAdapter extends BaseAdapter {
   }
 
   async cancelJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, () => '?', 'mysql');
+    const { clause, params } = criteriaClause(criteria, () => '?', 'mysql', 'cancelJobs');
     const [result] = await this.pool.query<ResultSetHeader>(
       `${SQL.mysql.cancelJobs}${clause}`,
       params
@@ -326,7 +335,7 @@ export class MySQLAdapter extends BaseAdapter {
   }
 
   async retryJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, () => '?', 'mysql');
+    const { clause, params } = criteriaClause(criteria, () => '?', 'mysql', 'retryJobs');
     // Raising max_attempts matters for jobs discarded after exhausting them:
     // without headroom the job is discarded again on its very next fetch.
     const [result] = await this.pool.query<ResultSetHeader>(
@@ -507,7 +516,7 @@ export class MySQLAdapter extends BaseAdapter {
     try {
       // Connection-scoped rather than transaction-scoped, so it must be
       // released explicitly -- see the finally block.
-      await connection.query('SELECT GET_LOCK(?, ?)', [lockName, 10]);
+      await acquireLock(connection, lockName, 10);
       await connection.beginTransaction();
 
       const params: unknown[] = period !== null ? [uniqueKey, states, period] : [uniqueKey, states];
@@ -669,6 +678,8 @@ export class MySQLAdapter extends BaseAdapter {
     const connection = await this.pool.getConnection();
     const heldLocks: string[] = [];
     try {
+      // Each unique lookup must see the previous lock holder's commit, even midway through a batch.
+      if (hasUnique) await connection.query('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
       await connection.beginTransaction();
       const out: { job: Job; conflict: boolean }[] = [];
 
@@ -689,7 +700,7 @@ export class MySQLAdapter extends BaseAdapter {
         // batch took, in `finally`, once the whole batch's outcome (commit or
         // rollback) is decided -- exactly as long as `insertUnique` holds it
         // for a single insert.
-        await connection.query('SELECT GET_LOCK(?, ?)', [lockName, 10]);
+        await acquireLock(connection, lockName, 10);
         heldLocks.push(lockName);
 
         const params: unknown[] = period !== null ? [uniqueKey, states, period] : [uniqueKey, states];

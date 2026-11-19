@@ -2,6 +2,7 @@ import type {
   BulkJobInsert,
   DatabaseAdapter,
   Job,
+  JobCriteria,
   JobOrderBy,
   JobOrderByField,
   JobState,
@@ -572,18 +573,37 @@ function tagsClause(
   };
 }
 
-/**
- * Builds the shared filter for bulk job operations (`cancelJobs`,
- * `retryJobs`) and for the read-only query API (`listJobs`, `countJobs`). An
- * empty criteria object is rejected by callers of the bulk operations rather
- * than silently matching every job -- see `assertScoped` in `izi-queue.ts`;
- * `listJobs`/`countJobs` are read-only and impose no such requirement.
- */
+/** Validate values before drivers interpret them as SQL parameters. */
+export function validateCriteria(criteria: JobCriteria, operation?: 'cancelJobs' | 'retryJobs'): void {
+  for (const key of ['queue', 'worker'] as const) {
+    if (criteria[key] !== undefined && typeof criteria[key] !== 'string') {
+      throw new TypeError(`izi-queue: ${key} must be a string`);
+    }
+  }
+  for (const key of ['ids', 'state', 'tags'] as const) {
+    const values = criteria[key];
+    if (values === undefined) continue;
+    if (!Array.isArray(values)) throw new TypeError(`izi-queue: ${key} must be an array`);
+    for (const value of values) {
+      if (key === 'ids' ? !Number.isSafeInteger(value) : typeof value !== 'string') {
+        throw new TypeError(`izi-queue: invalid value in ${key}`);
+      }
+    }
+  }
+
+  if (operation && criteria.all !== true && !criteria.queue && !criteria.worker &&
+      !criteria.ids?.length && !criteria.state?.length && !criteria.tags?.length) {
+    throw new Error(`${operation} requires at least one criterion. Pass { all: true } to act on every job.`);
+  }
+}
+
 export function criteriaClause(
-  criteria: import('../types.js').JobCriteria,
+  criteria: JobCriteria,
   placeholder: (index: number) => string,
-  dialect: SqlDialect
+  dialect: SqlDialect,
+  operation?: 'cancelJobs' | 'retryJobs'
 ): { clause: string; params: unknown[] } {
+  validateCriteria(criteria, operation);
   const params: unknown[] = [];
   let clause = '';
   let index = 1;
@@ -671,8 +691,7 @@ export function orderByClause(orderBy?: JobOrderBy): string {
     throw new Error(`izi-queue: listJobs orderBy.direction must be 'asc' or 'desc', got ${String(direction)}`);
   }
 
-  const column = JOB_ORDER_BY_COLUMNS[field];
-  if (!column) {
+  if (typeof field !== 'string' || !Object.hasOwn(JOB_ORDER_BY_COLUMNS, field)) {
     throw new Error(
       `izi-queue: invalid listJobs orderBy.field "${String(field)}". Must be one of: ${Object.keys(JOB_ORDER_BY_COLUMNS).join(', ')}`
     );
@@ -680,7 +699,7 @@ export function orderByClause(orderBy?: JobOrderBy): string {
 
   const sqlDirection = direction.toUpperCase();
   const tiebreak = field === 'id' ? '' : `, id ${sqlDirection}`;
-  return `ORDER BY ${column} ${sqlDirection}${tiebreak}`;
+  return `ORDER BY ${JOB_ORDER_BY_COLUMNS[field]} ${sqlDirection}${tiebreak}`;
 }
 
 /** Every job state, used to seed `countJobs`' result so every key is present. */

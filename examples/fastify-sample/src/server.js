@@ -187,6 +187,9 @@ fastify.delete('/jobs', async (request, reply) => {
   if (worker) criteria.worker = worker;
   if (queueName) criteria.queue = queueName;
 
+  if (!worker && !queueName) {
+    return reply.status(400).send({ error: 'Provide a worker or queue filter' });
+  }
   const cancelled = await queue.cancelJobs(criteria);
 
   return { message: `Cancelled ${cancelled} jobs`, count: cancelled };
@@ -230,7 +233,7 @@ const start = async () => {
     fastify.log.info('Queue processing started');
 
     // Start HTTP server
-    await fastify.listen({ port: 3000, host: '0.0.0.0' });
+    await fastify.listen({ port: 3000, host: '127.0.0.1' });
     fastify.log.info('Server listening on http://localhost:3000');
   } catch (err) {
     fastify.log.error(err);

@@ -8,6 +8,16 @@ While the version is below 1.0.0, breaking changes are released as minor version
 
 ## [Unreleased]
 
+### Security
+
+- Bulk cancellations and retries require a filter or the boolean `all: true` through both the queue and built-in adapters. Database queries reject malformed filters and unknown sort fields.
+- The optional MySQL driver now requires `mysql2` 3.23.1 or later in the 3.x line.
+- The Fastify example uses Fastify 5, requires Node.js 22 or later, and listens on loopback.
+
+### Fixed
+
+- MySQL migrations and unique inserts stop when their advisory lock is unavailable. Concurrent batches see unique jobs committed by the previous lock holder.
+
 ## [0.10.0] - 2026-09-07
 
 ### Added

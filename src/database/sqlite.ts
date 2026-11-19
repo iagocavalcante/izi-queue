@@ -289,7 +289,7 @@ export class SQLiteAdapter extends BaseAdapter {
   }
 
   async cancelJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, () => '?', 'sqlite');
+    const { clause, params } = criteriaClause(criteria, () => '?', 'sqlite', 'cancelJobs');
     const stmt = this.db.prepare(`
       UPDATE izi_jobs
       SET state = 'cancelled', cancelled_at = datetime('now')
@@ -299,7 +299,7 @@ export class SQLiteAdapter extends BaseAdapter {
   }
 
   async retryJobs(criteria: JobCriteria): Promise<number> {
-    const { clause, params } = criteriaClause(criteria, () => '?', 'sqlite');
+    const { clause, params } = criteriaClause(criteria, () => '?', 'sqlite', 'retryJobs');
     // Raising max_attempts matters for jobs that were discarded after
     // exhausting them: without headroom the job would be discarded again on
     // its very next fetch.

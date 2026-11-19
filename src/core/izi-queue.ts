@@ -35,32 +35,10 @@ import {
   getIsolationStats
 } from './worker.js';
 import { randomUUID } from 'crypto';
-import { DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, runInBatches } from '../database/adapter.js';
+import { DEFAULT_BATCH_SIZE, DEFAULT_NODE_TTL, runInBatches, validateCriteria } from '../database/adapter.js';
 
 export interface IziQueueFullConfig extends IziQueueConfig {
   plugins?: Plugin[];
-}
-
-/**
- * Bulk operations must be scoped. An HTTP handler that forwards optional
- * filters would otherwise act on every job in the database when called with
- * none of them.
- */
-function assertScoped(criteria: JobCriteria, operation: string): void {
-  if (criteria.all) return;
-
-  const scoped =
-    (criteria.ids && criteria.ids.length > 0) ||
-    criteria.queue ||
-    criteria.worker ||
-    (criteria.state && criteria.state.length > 0) ||
-    (criteria.tags && criteria.tags.length > 0);
-
-  if (!scoped) {
-    throw new Error(
-      `${operation} requires at least one criterion. Pass { all: true } to act on every job.`
-    );
-  }
 }
 
 export interface InsertResult<T = Record<string, unknown>> {
@@ -650,7 +628,7 @@ export class IziQueue {
   }
 
   async cancelJobs(criteria: JobCriteria): Promise<number> {
-    assertScoped(criteria, 'cancelJobs');
+    validateCriteria(criteria, 'cancelJobs');
     const count = await this.config.database.cancelJobs(criteria);
 
     if (count > 0 && this.config.cluster) {
@@ -676,7 +654,7 @@ export class IziQueue {
    * on the very next fetch.
    */
   async retryJobs(criteria: JobCriteria): Promise<number> {
-    assertScoped(criteria, 'retryJobs');
+    validateCriteria(criteria, 'retryJobs');
 
     if (!this.config.database.retryJobs) {
       throw new Error('The configured database adapter does not support retryJobs');

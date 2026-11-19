@@ -10,8 +10,7 @@ Be respectful and constructive in all interactions. We're all here to build some
 
 ### Prerequisites
 
-- Node.js 18.0.0 or higher
-- npm 8.0.0 or higher
+- A supported Node.js LTS release (22.13 or later) and its bundled npm
 - Git
 
 ### Setup
